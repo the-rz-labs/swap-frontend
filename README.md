@@ -49,10 +49,15 @@ Open http://localhost:3000.
 | `hooks/useSwapFlow.ts` | Step-by-step executor (approvals, RzSwap swap, Relay execute) |
 | `components/SwapCard.tsx` | The swap UI |
 
+## Routing
+
+The BSC leg path is resolved **automatically** at quote/execution time (`lib/route.ts`): it probes
+the direct pair plus routes via WBNB / USDT / RZUSD and keeps the candidate with the best on-chain
+quote. Most RZ tokens (e.g. CAR) only have a WBNB pair, so the direct `[token, USDT]` path reverts
+and the WBNB route is used instead. Add more bases to `INTERMEDIARIES` if a token needs them.
+
 ## Notes & TODO before mainnet
 
 - **Token decimals** default to 18 in `lib/tokens.ts`; verify each token on-chain.
-- **PancakeSwap paths** default to a direct `[tokenIn, tokenOut]` hop. If a token has no direct USDT
-  pair, set `bscRouteHops` on it in `lib/tokens.ts` (e.g. route via WBNB or RZUSD).
 - The contract must be **funded with output-token inventory** and the tokens **authorized** on
   RzSwap, or swaps revert with `InsufficientLiquidity` / `UnsupportedToken`.

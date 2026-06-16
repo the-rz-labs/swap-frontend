@@ -11,7 +11,8 @@ import {
 } from "@wagmi/core";
 import { wagmiConfig } from "@/lib/wagmi";
 import { BSC_CHAIN_ID, USDT_BSC, type Token } from "@/lib/tokens";
-import { RZSWAP_ABI, ERC20_ABI, RZSWAP_ADDRESS, pathToHub, pathFromHub, buildBscPath } from "@/lib/rzswap";
+import { RZSWAP_ABI, ERC20_ABI, RZSWAP_ADDRESS } from "@/lib/rzswap";
+import { resolveBestBscPath } from "@/lib/route";
 import { getRelayQuote, executeRelay, relayOutputAmount } from "@/lib/relay";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
 
@@ -101,21 +102,16 @@ export function useSwapFlow() {
 
   // ── leg builders ────────────────────────────────────────────────────────
 
-  /** RzSwap leg: tokenIn → tokenOut on BSC. `amount` 0n means "use the measured hub intermediate". */
+  /** RzSwap leg: tokenIn → tokenOut on BSC. `useIntermediate` uses the measured hub amount. */
   const makeRzSwapLeg = useCallback(
-    (ctx: SwapContext, tokenIn: Token, tokenOut: Token, path: Address[], useIntermediate: boolean): LegRunner =>
+    (ctx: SwapContext, tokenIn: Token, tokenOut: Token, useIntermediate: boolean): LegRunner =>
       async () => {
         await ensureChain(BSC_CHAIN_ID);
         const amountIn = useIntermediate ? ctxRef.current.intermediate : ctx.amountIn;
         if (amountIn <= 0n) throw new Error("No input amount available for the on-chain swap.");
 
-        const quoted = (await readContract(wagmiConfig, {
-          address: RZSWAP_ADDRESS,
-          abi: RZSWAP_ABI,
-          functionName: "getOutputAmount",
-          args: [amountIn, path],
-          chainId: BSC_CHAIN_ID,
-        })) as bigint;
+        // Resolve the best live PancakeSwap path (direct or via WBNB/USDT/RZUSD) for this amount.
+        const { path, amountOut: quoted } = await resolveBestBscPath(amountIn, tokenIn.address, tokenOut.address);
         const minOut = applySlippage(quoted, ctx.slippageBps);
 
         await ensureAllowance(tokenIn.address, ctx.address, RZSWAP_ADDRESS, amountIn, BSC_CHAIN_ID);
@@ -205,12 +201,12 @@ export function useSwapFlow() {
 
       if (plan.kind === "local") {
         legState.push({ key: "rzswap", label: `Swap ${ctx.from.symbol} → ${ctx.to.symbol}`, status: "pending", chainId: BSC_CHAIN_ID });
-        runners.push(makeRzSwapLeg(ctx, ctx.from, ctx.to, buildBscPath(ctx.from, ctx.to), false));
+        runners.push(makeRzSwapLeg(ctx, ctx.from, ctx.to, false));
       } else if (plan.kind === "outbound") {
         let idx = 0;
         if (!plan.hubIsEndpoint) {
           legState.push({ key: "rzswap", label: `Swap ${ctx.from.symbol} → USDT`, status: "pending", chainId: BSC_CHAIN_ID });
-          runners.push(makeRzSwapLeg(ctx, ctx.from, USDT_BSC, pathToHub(ctx.from), false));
+          runners.push(makeRzSwapLeg(ctx, ctx.from, USDT_BSC, false));
           idx = 1;
         }
         legState.push({ key: "relay", label: `Bridge USDT → ${ctx.to.symbol}`, status: "pending", chainId: BSC_CHAIN_ID });
@@ -222,7 +218,7 @@ export function useSwapFlow() {
         runners.push(makeRelayLeg(ctx, ctx.from.chainId, ctx.from.address, BSC_CHAIN_ID, USDT_BSC.address, false, true, 0));
         if (!plan.hubIsEndpoint) {
           legState.push({ key: "rzswap", label: `Swap USDT → ${ctx.to.symbol}`, status: "pending", chainId: BSC_CHAIN_ID });
-          runners.push(makeRzSwapLeg(ctx, USDT_BSC, ctx.to, pathFromHub(ctx.to), true));
+          runners.push(makeRzSwapLeg(ctx, USDT_BSC, ctx.to, true));
         }
       }
 

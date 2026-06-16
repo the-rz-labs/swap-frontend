@@ -1,6 +1,4 @@
 import type { Address } from "viem";
-import { getAddress } from "viem";
-import { USDT_BSC, type Token } from "./tokens";
 
 /** Deployed RzSwap address on BSC. Set NEXT_PUBLIC_RZSWAP_ADDRESS after deploying. */
 export const RZSWAP_ADDRESS = (process.env.NEXT_PUBLIC_RZSWAP_ADDRESS ??
@@ -62,6 +60,20 @@ export const RZSWAP_ABI = [
     inputs: [],
     outputs: [{ name: "", type: "bool" }],
   },
+  // ── custom errors (so viem can decode reverts to readable names) ──
+  { type: "error", name: "UnsupportedToken", inputs: [] },
+  { type: "error", name: "SlippageExceeded", inputs: [] },
+  { type: "error", name: "ZeroAmount", inputs: [] },
+  { type: "error", name: "InvalidReceiver", inputs: [] },
+  { type: "error", name: "InvalidTransfer", inputs: [] },
+  { type: "error", name: "InsufficientLiquidity", inputs: [] },
+  { type: "error", name: "InsufficientBalance", inputs: [] },
+  { type: "error", name: "InvalidAddress", inputs: [] },
+  { type: "error", name: "InvalidPath", inputs: [] },
+  { type: "error", name: "PricingFailed", inputs: [] },
+  { type: "error", name: "TimelockActive", inputs: [{ name: "activatesAt", type: "uint256" }] },
+  { type: "error", name: "NativeTransferFailed", inputs: [] },
+  { type: "error", name: "EnforcedPause", inputs: [] },
 ] as const;
 
 export const ERC20_ABI = [
@@ -71,22 +83,3 @@ export const ERC20_ABI = [
   { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint8" }] },
   { type: "function", name: "symbol", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "string" }] },
 ] as const;
-
-/**
- * Builds the PancakeSwap routing path the RzSwap contract validates and prices against.
- * `from` and `to` must both be BSC tokens; optional `bscRouteHops` are inserted between them.
- */
-export function buildBscPath(from: Token, to: Token): Address[] {
-  const hops = from.bscRouteHops ?? to.bscRouteHops ?? [];
-  return [getAddress(from.address), ...hops.map(getAddress), getAddress(to.address)];
-}
-
-/** Path for the rz-token → USDT hub leg of an outbound swap. */
-export function pathToHub(from: Token): Address[] {
-  return buildBscPath(from, USDT_BSC);
-}
-
-/** Path for the USDT hub → rz-token leg of an inbound swap. */
-export function pathFromHub(to: Token): Address[] {
-  return buildBscPath(USDT_BSC, to);
-}

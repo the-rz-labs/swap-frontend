@@ -5,6 +5,9 @@ export const BSC_CHAIN_ID = 56;
 /** Relay (and most aggregators) represent a chain's native currency with the zero address. */
 export const NATIVE_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
 
+/** Wrapped BNB — the dominant PancakeSwap base pair; used as a routing intermediary. */
+export const WBNB_ADDRESS: Address = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
+
 export type Token = {
   symbol: string;
   name: string;
@@ -13,12 +16,6 @@ export type Token = {
   chainId: number;
   /** Marks the BSC token used as the bridge intermediary between Relay and RzSwap. */
   isHubIntermediary?: boolean;
-  /**
-   * Optional intermediate PancakeSwap hops (BSC addresses) inserted between this token and the
-   * USDT hub when building the RzSwap path. Use when a token has no direct USDT pair. Leave empty
-   * for a direct [token, USDT] / [USDT, token] route.
-   */
-  bscRouteHops?: Address[];
 };
 
 /**
