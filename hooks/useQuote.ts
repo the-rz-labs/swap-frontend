@@ -2,8 +2,8 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { BSC_CHAIN_ID, USDT_BSC, tokenKey, type Token } from "@/lib/tokens";
-import { resolveBestBscPath } from "@/lib/route";
-import { getRelayQuote, relayOutputAmount } from "@/lib/relay";
+import { resolveBestBscPath, bscUsdValue } from "@/lib/route";
+import { getRelayQuote, relayOutputAmount, relayUsd } from "@/lib/relay";
 import { classify } from "@/lib/swapPlan";
 
 export type QuoteResult = {
@@ -11,6 +11,9 @@ export type QuoteResult = {
   output: bigint;
   /** USDT hub amount on BSC, when the route passes through the hub. */
   hubAmount?: bigint;
+  /** Best-effort USD value of the input / output. */
+  inputUsd?: number;
+  outputUsd?: number;
 };
 
 async function computeQuote(from: Token, to: Token, amountIn: bigint, recipient?: string): Promise<QuoteResult> {
@@ -18,7 +21,8 @@ async function computeQuote(from: Token, to: Token, amountIn: bigint, recipient?
 
   if (kind === "local") {
     const { amountOut } = await resolveBestBscPath(amountIn, from.address, to.address);
-    return { output: amountOut };
+    const [inputUsd, outputUsd] = await Promise.all([bscUsdValue(from, amountIn), bscUsdValue(to, amountOut)]);
+    return { output: amountOut, inputUsd, outputUsd };
   }
 
   if (!recipient) throw new Error("Connect your wallet to quote a cross-chain route.");
@@ -38,7 +42,8 @@ async function computeQuote(from: Token, to: Token, amountIn: bigint, recipient?
     });
     const output = relayOutputAmount(quote);
     if (output == null) throw new Error("Relay returned no output amount.");
-    return { output, hubAmount };
+    const { inUsd, outUsd } = relayUsd(quote);
+    return { output, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
   }
 
   // inbound
@@ -53,9 +58,10 @@ async function computeQuote(from: Token, to: Token, amountIn: bigint, recipient?
   });
   const hubAmount = relayOutputAmount(quote);
   if (hubAmount == null) throw new Error("Relay returned no output amount.");
-  if (hubIsEndpoint) return { output: hubAmount, hubAmount };
+  const { inUsd, outUsd } = relayUsd(quote);
+  if (hubIsEndpoint) return { output: hubAmount, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
   const { amountOut } = await resolveBestBscPath(hubAmount, USDT_BSC.address, to.address);
-  return { output: amountOut, hubAmount };
+  return { output: amountOut, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
 }
 
 export function useQuote(from: Token, to: Token, amountIn: bigint, recipient?: string) {

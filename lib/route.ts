@@ -1,8 +1,8 @@
 import type { Address } from "viem";
-import { getAddress } from "viem";
+import { getAddress, formatUnits } from "viem";
 import { readContract } from "@wagmi/core";
 import { wagmiConfig } from "./wagmi";
-import { BSC_CHAIN_ID, USDT_BSC, WBNB_ADDRESS } from "./tokens";
+import { BSC_CHAIN_ID, USDT_BSC, WBNB_ADDRESS, tokenKey, type Token } from "./tokens";
 import { RZSWAP_ABI, RZSWAP_ADDRESS, RZSWAP_CONFIGURED } from "./rzswap";
 
 /**
@@ -61,4 +61,19 @@ export async function resolveBestBscPath(amountIn: bigint, from: Address, to: Ad
 
   if (!best) throw new Error("No PancakeSwap route with liquidity for this pair.");
   return best;
+}
+
+/**
+ * Approximate USD value of a BSC token amount, by quoting it to USDT (≈ $1). Returns undefined if
+ * no route exists. USDT itself is treated as $1.
+ */
+export async function bscUsdValue(token: Token, amount: bigint): Promise<number | undefined> {
+  if (amount <= 0n) return 0;
+  if (tokenKey(token) === tokenKey(USDT_BSC)) return Number(formatUnits(amount, 18));
+  try {
+    const { amountOut } = await resolveBestBscPath(amount, token.address, USDT_BSC.address);
+    return Number(formatUnits(amountOut, 18));
+  } catch {
+    return undefined;
+  }
 }

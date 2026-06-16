@@ -82,6 +82,16 @@ export function relayMinimumOutput(quote: Execute): bigint | undefined {
   return raw != null ? BigInt(raw) : undefined;
 }
 
+/** USD values of the input/output currencies from a Relay quote, if present. */
+export function relayUsd(quote: Execute): { inUsd?: number; outUsd?: number } {
+  const i = quote.details?.currencyIn?.amountUsd;
+  const o = quote.details?.currencyOut?.amountUsd;
+  return {
+    inUsd: i != null ? Number(i) : undefined,
+    outUsd: o != null ? Number(o) : undefined,
+  };
+}
+
 /** True once every step of an executed quote is complete. */
 export function relayIsComplete(data: ProgressData | Execute): boolean {
   const steps = data.steps ?? [];

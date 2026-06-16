@@ -22,3 +22,11 @@ export function formatAmount(value: bigint, decimals: number, maxFractionDigits 
 export function shortHash(hash: string): string {
   return `${hash.slice(0, 6)}…${hash.slice(-4)}`;
 }
+
+/** Formats a USD number like "$1,234.56"; returns undefined for missing/invalid input. */
+export function formatUsd(n?: number): string | undefined {
+  if (n == null || !isFinite(n)) return undefined;
+  if (n === 0) return "$0.00";
+  if (Math.abs(n) < 0.01) return "<$0.01";
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+}

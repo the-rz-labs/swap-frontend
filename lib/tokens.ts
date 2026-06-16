@@ -1,6 +1,7 @@
 import type { Address } from "viem";
 
 export const BSC_CHAIN_ID = 56;
+export const ETH_CHAIN_ID = 1;
 
 /** Relay (and most aggregators) represent a chain's native currency with the zero address. */
 export const NATIVE_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
@@ -8,24 +9,35 @@ export const NATIVE_ADDRESS: Address = "0x00000000000000000000000000000000000000
 /** Wrapped BNB — the dominant PancakeSwap base pair; used as a routing intermediary. */
 export const WBNB_ADDRESS: Address = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
 
+const TW = "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains";
+
+export type ChainMeta = { id: number; name: string; shortName: string; logoURI: string };
+
+export const CHAINS: Record<number, ChainMeta> = {
+  [BSC_CHAIN_ID]: { id: BSC_CHAIN_ID, name: "BNB Chain", shortName: "BSC", logoURI: `${TW}/smartchain/info/logo.png` },
+  [ETH_CHAIN_ID]: { id: ETH_CHAIN_ID, name: "Ethereum", shortName: "Ethereum", logoURI: `${TW}/ethereum/info/logo.png` },
+};
+
 export type Token = {
   symbol: string;
   name: string;
   address: Address;
   decimals: number;
   chainId: number;
+  /** Logo URL; falls back to a generated avatar when absent or it 404s. */
+  logoURI?: string;
   /** Marks the BSC token used as the bridge intermediary between Relay and RzSwap. */
   isHubIntermediary?: boolean;
 };
 
 /**
  * The 17 BSC tokens RzSwap supports. USDT_BSC is the hub intermediary that bridges to/from Relay.
+ * RZ-ecosystem tokens have no public logos → they render as generated avatars.
  *
- * NOTE: decimals default to 18 (BSC convention, incl. BSC-USDT). Verify on-chain before mainnet
- * use — the UI also reads decimals dynamically where it can.
+ * NOTE: decimals default to 18 (BSC convention, incl. BSC-USDT). Verify on-chain before mainnet use.
  */
 export const BSC_TOKENS: Token[] = [
-  { symbol: "USDT", name: "Tether USD (BSC)", address: "0x55d398326f99059fF775485246999027B3197955", decimals: 18, chainId: BSC_CHAIN_ID, isHubIntermediary: true },
+  { symbol: "USDT", name: "Tether USD", address: "0x55d398326f99059fF775485246999027B3197955", decimals: 18, chainId: BSC_CHAIN_ID, isHubIntermediary: true, logoURI: `${TW}/smartchain/assets/0x55d398326f99059fF775485246999027B3197955/logo.png` },
   { symbol: "MGC", name: "MGC", address: "0xbb73BB2505AC4643d5C0a99c2A1F34B3DfD09D11", decimals: 18, chainId: BSC_CHAIN_ID },
   { symbol: "REALESTATE", name: "Real Estate", address: "0x32477cf0e324f9a9cb49e8803fa4de9f80f8d0d4", decimals: 18, chainId: BSC_CHAIN_ID },
   { symbol: "RZ", name: "RZ", address: "0x6BC5AbCc56874D7fACb90C2c3812cc19aAf9B204", decimals: 18, chainId: BSC_CHAIN_ID },
@@ -46,27 +58,18 @@ export const BSC_TOKENS: Token[] = [
 
 export const USDT_BSC: Token = BSC_TOKENS.find((t) => t.isHubIntermediary)!;
 
-/** Curated cross-chain origin/destination tokens routed through Relay. Extend as needed. */
+/** Cross-chain tokens on Ethereum, routed through Relay. */
 export const REMOTE_TOKENS: Token[] = [
-  { symbol: "ETH", name: "Ethereum", address: NATIVE_ADDRESS, decimals: 18, chainId: 1 },
-  { symbol: "USDT", name: "Tether USD", address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6, chainId: 1 },
-  { symbol: "USDC", name: "USD Coin", address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6, chainId: 1 },
-  { symbol: "ETH", name: "Ethereum (Arbitrum)", address: NATIVE_ADDRESS, decimals: 18, chainId: 42161 },
-  { symbol: "USDC", name: "USD Coin (Arbitrum)", address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", decimals: 6, chainId: 42161 },
-  { symbol: "ETH", name: "Ethereum (Base)", address: NATIVE_ADDRESS, decimals: 18, chainId: 8453 },
-  { symbol: "USDC", name: "USD Coin (Base)", address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals: 6, chainId: 8453 },
-  { symbol: "ETH", name: "Ethereum (Optimism)", address: NATIVE_ADDRESS, decimals: 18, chainId: 10 },
-  { symbol: "POL", name: "Polygon", address: NATIVE_ADDRESS, decimals: 18, chainId: 137 },
-  { symbol: "USDC", name: "USD Coin (Polygon)", address: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", decimals: 6, chainId: 137 },
+  { symbol: "ETH", name: "Ethereum", address: NATIVE_ADDRESS, decimals: 18, chainId: ETH_CHAIN_ID, logoURI: `${TW}/ethereum/info/logo.png` },
+  { symbol: "USDT", name: "Tether USD", address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6, chainId: ETH_CHAIN_ID, logoURI: `${TW}/ethereum/assets/0xdAC17F958D2ee523a2206206994597C13D831ec7/logo.png` },
+  { symbol: "USDC", name: "USD Coin", address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6, chainId: ETH_CHAIN_ID, logoURI: `${TW}/ethereum/assets/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/logo.png` },
 ];
 
+export const ALL_TOKENS: Token[] = [...BSC_TOKENS, ...REMOTE_TOKENS];
+
 export const CHAIN_NAMES: Record<number, string> = {
-  56: "BNB Chain",
-  1: "Ethereum",
-  42161: "Arbitrum",
-  8453: "Base",
-  10: "Optimism",
-  137: "Polygon",
+  [BSC_CHAIN_ID]: "BNB Chain",
+  [ETH_CHAIN_ID]: "Ethereum",
 };
 
 export function isBscToken(t: Token): boolean {
