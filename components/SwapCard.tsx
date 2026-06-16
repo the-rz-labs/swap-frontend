@@ -71,22 +71,22 @@ export function SwapCard() {
     !blockedByConfig &&
     !quote.isError;
 
-  async function mainAction() {
+  function mainAction() {
     if (!isConnected || !address) {
       open();
       return;
     }
     if (flow.status === "idle") {
-      flow.prepare({ from, to, amountIn, slippageBps, address: address as `0x${string}` });
+      flow.start({ from, to, amountIn, slippageBps, address: address as `0x${string}` });
       return;
     }
-    if (flow.status === "awaiting") {
-      await flow.confirmNext();
+    if (flow.status === "error") {
+      flow.retry();
       return;
     }
-    if (flow.status === "done" || flow.status === "error") {
+    if (flow.status === "done") {
       flow.reset();
-      if (flow.status === "done") setAmount("");
+      setAmount("");
     }
   }
 
@@ -95,17 +95,13 @@ export function SwapCard() {
     if (blockedByConfig) return "RzSwap not configured";
     if (plan.kind === "invalid") return plan.error ?? "Invalid pair";
     if (amountIn === 0n) return "Enter an amount";
-    if (flow.status === "idle") return "Review route";
-    if (flow.status === "running") return "Confirming…";
-    if (flow.status === "awaiting")
-      return `Confirm step ${flow.current + 1} of ${flow.legs.length}: ${flow.legs[flow.current]?.label}`;
+    if (flow.status === "running") return "Swapping…";
     if (flow.status === "done") return "Swap complete ✓ — start new";
-    if (flow.status === "error") return "Retry — review again";
-    return "Swap";
+    if (flow.status === "error") return "Retry";
+    return plan.kind === "inbound" && !plan.hubIsEndpoint ? "Swap (1 transaction)" : "Swap";
   })();
 
-  const buttonDisabled =
-    flow.status === "running" || (flow.status === "idle" && !canStart) || (!isConnected ? false : !canStart && flow.status === "idle");
+  const buttonDisabled = flow.status === "running" || (flow.status === "idle" && !canStart);
 
   return (
     <div className="w-full max-w-md rounded-xl2 border border-border bg-panel p-4 shadow-2xl">
@@ -203,9 +199,14 @@ export function SwapCard() {
         {buttonLabel}
       </button>
 
-      {flow.status === "awaiting" && flow.current > 0 && (
+      {flow.status === "running" && flow.legs.length > 1 && (
         <p className="mt-2 text-center text-xs text-muted">
-          Step {flow.current} confirmed. Confirm the next step to continue.
+          Approve each wallet prompt as it appears — the steps run automatically.
+        </p>
+      )}
+      {plan.kind === "inbound" && !plan.hubIsEndpoint && flow.status === "idle" && amountIn > 0n && (
+        <p className="mt-2 text-center text-xs text-muted">
+          Single transaction: Relay bridges to BNB Chain and runs the RzSwap swap in the same fill.
         </p>
       )}
     </div>

@@ -24,6 +24,9 @@ export function ensureRelay() {
   return getClient();
 }
 
+/** A raw destination-chain call Relay executes via its multicaller after the bridge fills. */
+export type RelayCallTx = { to: string; value?: string; data: string };
+
 export type RelayQuoteInput = {
   fromChainId: number;
   fromCurrency: string; // token address, or zero address for native
@@ -34,6 +37,10 @@ export type RelayQuoteInput = {
   /** Destination recipient (defaults to the connected user). */
   recipient?: string;
   wallet?: WalletClient;
+  /** Destination-chain calls to run as part of the fill (bridge-and-execute). */
+  txs?: RelayCallTx[];
+  /** Refund on the origin chain if the destination execution can't complete. */
+  refundOnOrigin?: boolean;
 };
 
 /** Fetches a Relay EXACT_INPUT quote. Wallet is optional for read-only estimates. */
@@ -48,6 +55,8 @@ export async function getRelayQuote(input: RelayQuoteInput): Promise<Execute> {
     tradeType: "EXACT_INPUT",
     recipient: input.recipient,
     wallet: input.wallet,
+    txs: input.txs,
+    options: input.refundOnOrigin != null ? { refundOnOrigin: input.refundOnOrigin } : undefined,
   });
 }
 

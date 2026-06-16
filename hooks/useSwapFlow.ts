@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import type { Address, WalletClient } from "viem";
+import { encodeFunctionData, type Address, type WalletClient } from "viem";
 import {
   readContract,
   writeContract,
@@ -13,7 +13,7 @@ import { wagmiConfig } from "@/lib/wagmi";
 import { BSC_CHAIN_ID, USDT_BSC, type Token } from "@/lib/tokens";
 import { RZSWAP_ABI, ERC20_ABI, RZSWAP_ADDRESS } from "@/lib/rzswap";
 import { resolveBestBscPath } from "@/lib/route";
-import { getRelayQuote, executeRelay, relayOutputAmount } from "@/lib/relay";
+import { getRelayQuote, executeRelay, relayOutputAmount, relayMinimumOutput, type RelayCallTx } from "@/lib/relay";
 import { isBenignRelaySolverError } from "@/lib/relayErrors";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
 
@@ -221,6 +221,90 @@ export function useSwapFlow() {
     [patchLeg],
   );
 
+  /**
+   * SINGLE-TRANSACTION inbound leg (remote → rz-token). Relay bridges the origin asset to USDT on
+   * BSC and, in the same fill, runs `approve(RzSwap)` + `RzSwap.swap(USDT → rz, receiver = user)`
+   * via its multicaller. The user signs only the origin deposit.
+   *
+   * The swap's amountIn is pinned to the bridge's GUARANTEED minimum USDT output (the multicaller is
+   * always delivered at least this), so the on-arrival swap never reverts for lack of balance; any
+   * surplus is refunded to the user by Relay. `refundOnOrigin` returns the user's funds on the
+   * source chain if the destination swap can't fill (e.g. treasury too low).
+   */
+  const makeInboundBridgeSwapLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        await ensureChain(ctx.from.chainId);
+        const wallet = (await getWalletClient(wagmiConfig, { chainId: ctx.from.chainId })) as WalletClient;
+
+        // 1) Preliminary quote (no destination call) to learn the guaranteed USDT delivered.
+        const prelim = await getRelayQuote({
+          fromChainId: ctx.from.chainId,
+          fromCurrency: ctx.from.address,
+          toChainId: BSC_CHAIN_ID,
+          toCurrency: USDT_BSC.address,
+          amount: ctx.amountIn.toString(),
+          recipient: ctx.address,
+          wallet,
+        });
+        const usdtMin = relayMinimumOutput(prelim) ?? relayOutputAmount(prelim);
+        if (usdtMin == null || usdtMin <= 0n) throw new Error("Could not quote the bridge output.");
+
+        // Builds a quote whose destination txs swap `swapAmountIn` USDT into the rz-token.
+        const build = async (swapAmountIn: bigint) => {
+          const { path, amountOut } = await resolveBestBscPath(swapAmountIn, USDT_BSC.address, ctx.to.address);
+          const minOut = applySlippage(amountOut, ctx.slippageBps);
+          const swapParams = {
+            tokenIn: USDT_BSC.address,
+            tokenOut: ctx.to.address,
+            amountIn: swapAmountIn,
+            minAmountOut: minOut,
+            receiver: ctx.address,
+            path,
+          };
+          const txs: RelayCallTx[] = [
+            {
+              to: USDT_BSC.address,
+              value: "0",
+              data: encodeFunctionData({ abi: ERC20_ABI, functionName: "approve", args: [RZSWAP_ADDRESS, swapAmountIn] }),
+            },
+            {
+              to: RZSWAP_ADDRESS,
+              value: "0",
+              data: encodeFunctionData({ abi: RZSWAP_ABI, functionName: "swap", args: [swapParams] }),
+            },
+          ];
+          const quote = await getRelayQuote({
+            fromChainId: ctx.from.chainId,
+            fromCurrency: ctx.from.address,
+            toChainId: BSC_CHAIN_ID,
+            toCurrency: USDT_BSC.address,
+            amount: ctx.amountIn.toString(),
+            recipient: ctx.address,
+            wallet,
+            txs,
+            refundOnOrigin: true,
+          });
+          return { quote, swapAmountIn };
+        };
+
+        // 2) Pin the swap input 1% under the guaranteed min to absorb destination-gas drift between
+        //    the plain and with-call quotes; re-pin once if the final min came in lower.
+        let attempt = await build((usdtMin * 99n) / 100n);
+        const finalMin = relayMinimumOutput(attempt.quote);
+        if (finalMin != null && finalMin < attempt.swapAmountIn) {
+          attempt = await build((finalMin * 99n) / 100n);
+        }
+
+        // 3) One signature: deposit on the origin chain; Relay fills + swaps on BSC.
+        await executeRelay(attempt.quote, wallet, (data) => {
+          const tx = data.txHashes?.[0];
+          if (tx) patchLeg(legIndex, { txHash: tx.txHash, chainId: tx.chainId });
+        });
+      },
+    [patchLeg],
+  );
+
   // ── prepare ─────────────────────────────────────────────────────────────
 
   const prepare = useCallback(
@@ -245,53 +329,60 @@ export function useSwapFlow() {
           makeRelayLeg(ctx, BSC_CHAIN_ID, USDT_BSC.address, ctx.to.chainId, ctx.to.address, !plan.hubIsEndpoint, false, idx),
         );
       } else if (plan.kind === "inbound") {
-        legState.push({ key: "relay", label: `Bridge ${ctx.from.symbol} → USDT`, status: "pending", chainId: ctx.from.chainId });
-        runners.push(makeRelayLeg(ctx, ctx.from.chainId, ctx.from.address, BSC_CHAIN_ID, USDT_BSC.address, false, true, 0));
-        if (!plan.hubIsEndpoint) {
-          legState.push({ key: "rzswap", label: `Swap USDT → ${ctx.to.symbol}`, status: "pending", chainId: BSC_CHAIN_ID });
-          runners.push(makeRzSwapLeg(ctx, USDT_BSC, ctx.to, true));
+        if (plan.hubIsEndpoint) {
+          // remote → USDT is a plain bridge, no on-chain swap leg.
+          legState.push({ key: "relay", label: `Bridge ${ctx.from.symbol} → USDT`, status: "pending", chainId: ctx.from.chainId });
+          runners.push(makeRelayLeg(ctx, ctx.from.chainId, ctx.from.address, BSC_CHAIN_ID, USDT_BSC.address, false, false, 0));
+        } else {
+          // Single transaction: bridge + RzSwap executed by Relay on arrival.
+          legState.push({ key: "relay", label: `Bridge ${ctx.from.symbol} → ${ctx.to.symbol} (1 tx)`, status: "pending", chainId: ctx.from.chainId });
+          runners.push(makeInboundBridgeSwapLeg(ctx, 0));
         }
       }
 
       runnersRef.current = runners;
       setLegs(legState);
       setCurrent(0);
-      setStatus(legState.length > 0 ? "awaiting" : "idle");
     },
-    [makeRzSwapLeg, makeRelayLeg],
+    [makeRzSwapLeg, makeRelayLeg, makeInboundBridgeSwapLeg],
   );
 
-  // ── run the current leg ──────────────────────────────────────────────────
+  // ── auto-run all legs sequentially (one click; wallet prompts in order) ────
 
-  const confirmNext = useCallback(async () => {
-    const index = current;
-    const runner = runnersRef.current[index];
-    if (!runner) return;
-
-    setStatus("running");
-    patchLeg(index, { status: "active", error: undefined });
-    try {
-      await runner();
-      patchLeg(index, { status: "done" });
-      const next = index + 1;
-      if (next >= runnersRef.current.length) {
-        setStatus("done");
-      } else {
-        setCurrent(next);
-        setStatus("awaiting");
+  const runFrom = useCallback(
+    async (startIndex: number) => {
+      setStatus("running");
+      for (let i = startIndex; i < runnersRef.current.length; i++) {
+        setCurrent(i);
+        patchLeg(i, { status: "active", error: undefined });
+        try {
+          await runnersRef.current[i]();
+          patchLeg(i, { status: "done" });
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : "Transaction failed";
+          patchLeg(i, { status: "error", error: message });
+          setStatus("error");
+          return;
+        }
       }
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "Transaction failed";
-      patchLeg(index, { status: "error", error: message });
-      setStatus("error");
-    }
-  }, [current, patchLeg]);
+      setStatus("done");
+    },
+    [patchLeg],
+  );
 
-  /** Re-run the current (failed) leg. */
-  const retry = useCallback(async () => {
-    patchLeg(current, { status: "pending", error: undefined });
-    setStatus("awaiting");
-  }, [current, patchLeg]);
+  /** Builds the legs and runs the whole swap from the first leg. */
+  const start = useCallback(
+    (ctx: SwapContext) => {
+      prepare(ctx);
+      void runFrom(0);
+    },
+    [prepare, runFrom],
+  );
 
-  return { legs, current, status, prepare, confirmNext, retry, reset };
+  /** Resume from the leg that failed (re-running it). */
+  const retry = useCallback(() => {
+    void runFrom(current);
+  }, [current, runFrom]);
+
+  return { legs, current, status, start, retry, reset };
 }

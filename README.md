@@ -5,16 +5,22 @@ Chain** (one of the 17 RzSwap tokens); the other side can be any Relay-supported
 
 ## How it works
 
-The app composes two primitives, with **USDT on BNB Chain as the hub**:
+The app composes two primitives, with **USDT on BNB Chain as the hub**, minimizing transactions:
 
-| Direction | Example | Legs |
+| Direction | Example | Transactions |
 |---|---|---|
-| Inbound | ETH (Ethereum) → CAR (BSC) | 1. Relay: ETH → USDT(BSC)  2. RzSwap: USDT → CAR |
-| Outbound | CAR (BSC) → ETH (Ethereum) | 1. RzSwap: CAR → USDT(BSC)  2. Relay: USDT → ETH |
-| Local | USDT (BSC) → CAR (BSC) | RzSwap only |
+| Inbound | ETH (Ethereum) → CAR (BSC) | **1 tx** — Relay bridges ETH→USDT(BSC) **and** runs `RzSwap.swap(USDT→CAR)` in the same fill (destination `txs`), delivering CAR to you. |
+| Outbound | CAR (BSC) → ETH (Ethereum) | **2 tx, auto** — RzSwap: CAR→USDT(BSC), then Relay: USDT→ETH. Runs back-to-back from one click. |
+| Local | USDT (BSC) → CAR (BSC) | **1 tx** — RzSwap only. |
 
-Each leg is an **explicit, user-confirmed step**. The intermediate USDT amount is measured by the
-on-chain balance delta, so the second leg always uses the exact amount actually received.
+**Inbound (single tx):** the swap is appended to Relay's fill via the quote `txs` field and executed
+by Relay's multicaller. The swap's input is pinned to the bridge's *guaranteed minimum* USDT output
+(so it can never revert for lack of balance), surplus is refunded to you, and `refundOnOrigin` returns
+your funds on the source chain if the on-arrival swap can't fill. See
+`hooks/useSwapFlow.ts` → `makeInboundBridgeSwapLeg`.
+
+**Outbound:** the on-chain RzSwap leg's USDT output is measured by balance delta and handed to the
+Relay leg, which then runs automatically.
 
 ## Stack
 
