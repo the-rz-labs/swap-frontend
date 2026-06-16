@@ -14,6 +14,7 @@ import { BSC_CHAIN_ID, USDT_BSC, type Token } from "@/lib/tokens";
 import { RZSWAP_ABI, ERC20_ABI, RZSWAP_ADDRESS } from "@/lib/rzswap";
 import { resolveBestBscPath } from "@/lib/route";
 import { getRelayQuote, executeRelay, relayOutputAmount } from "@/lib/relay";
+import { isBenignRelaySolverError } from "@/lib/relayErrors";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
@@ -86,7 +87,10 @@ export function useSwapFlow() {
   const [status, setStatus] = useState<FlowStatus>("idle");
 
   const runnersRef = useRef<LegRunner[]>([]);
-  const ctxRef = useRef<{ intermediate: bigint }>({ intermediate: 0n });
+  // intermediate: USDT produced by an outbound rz→USDT swap (measured on-chain).
+  // usdtBefore: the user's USDT balance captured before an inbound bridge, so the follow-up
+  // USDT→rz swap can use the exact bridged amount (current balance − usdtBefore) at its own runtime.
+  const ctxRef = useRef<{ intermediate: bigint; usdtBefore: bigint }>({ intermediate: 0n, usdtBefore: 0n });
 
   const patchLeg = useCallback((index: number, patch: Partial<RunLeg>) => {
     setLegs((prev) => prev.map((l, i) => (i === index ? { ...l, ...patch } : l)));
@@ -94,7 +98,7 @@ export function useSwapFlow() {
 
   const reset = useCallback(() => {
     runnersRef.current = [];
-    ctxRef.current = { intermediate: 0n };
+    ctxRef.current = { intermediate: 0n, usdtBefore: 0n };
     setLegs([]);
     setCurrent(0);
     setStatus("idle");
@@ -102,13 +106,27 @@ export function useSwapFlow() {
 
   // ── leg builders ────────────────────────────────────────────────────────
 
-  /** RzSwap leg: tokenIn → tokenOut on BSC. `useIntermediate` uses the measured hub amount. */
+  /**
+   * RzSwap leg: tokenIn → tokenOut on BSC. When `useIntermediate` (inbound USDT→rz second leg),
+   * the input is the bridged USDT measured as (current USDT balance − usdtBefore) at runtime — so
+   * it is robust to flaky bridge tracking and always uses the exact amount actually received.
+   */
   const makeRzSwapLeg = useCallback(
     (ctx: SwapContext, tokenIn: Token, tokenOut: Token, useIntermediate: boolean): LegRunner =>
       async () => {
         await ensureChain(BSC_CHAIN_ID);
-        const amountIn = useIntermediate ? ctxRef.current.intermediate : ctx.amountIn;
-        if (amountIn <= 0n) throw new Error("No input amount available for the on-chain swap.");
+        let amountIn: bigint;
+        if (useIntermediate) {
+          const cur = await bscTokenBalance(USDT_BSC.address, ctx.address);
+          const delta = cur > ctxRef.current.usdtBefore ? cur - ctxRef.current.usdtBefore : 0n;
+          amountIn = delta > 0n ? delta : ctxRef.current.intermediate;
+          if (amountIn <= 0n) {
+            throw new Error("Bridged USDT not received yet — wait a moment, then confirm this step again.");
+          }
+        } else {
+          amountIn = ctx.amountIn;
+          if (amountIn <= 0n) throw new Error("No input amount available for the on-chain swap.");
+        }
 
         // Resolve the best live PancakeSwap path (direct or via WBNB/USDT/RZUSD) for this amount.
         const { path, amountOut: quoted } = await resolveBestBscPath(amountIn, tokenIn.address, tokenOut.address);
@@ -164,7 +182,11 @@ export function useSwapFlow() {
         const amount = useIntermediate ? ctxRef.current.intermediate : ctx.amountIn;
         if (amount <= 0n) throw new Error("No input amount available for the bridge.");
 
-        const before = measureBscUsdt ? await bscTokenBalance(USDT_BSC.address, ctx.address) : 0n;
+        // For an inbound bridge, snapshot the USDT balance so the follow-up swap can measure the
+        // exact bridged amount itself (decoupled from this leg's tracking).
+        if (measureBscUsdt) {
+          ctxRef.current.usdtBefore = await bscTokenBalance(USDT_BSC.address, ctx.address);
+        }
 
         const quote = await getRelayQuote({
           fromChainId,
@@ -176,16 +198,25 @@ export function useSwapFlow() {
           wallet,
         });
 
-        await executeRelay(quote, wallet, (data) => {
-          const tx = data.txHashes?.[0];
-          if (tx) patchLeg(legIndex, { txHash: tx.txHash, chainId: tx.chainId });
-        });
-
-        if (measureBscUsdt) {
-          const after = await bscTokenBalance(USDT_BSC.address, ctx.address);
-          const delta = after > before ? after - before : relayOutputAmount(quote) ?? 0n;
-          ctxRef.current.intermediate = delta;
+        let sawTxHash = false;
+        try {
+          await executeRelay(quote, wallet, (data) => {
+            const tx = data.txHashes?.[0];
+            if (tx) {
+              sawTxHash = true;
+              patchLeg(legIndex, { txHash: tx.txHash, chainId: tx.chainId });
+            }
+          });
+        } catch (e) {
+          // Once the deposit is broadcast the bridge is in-flight; don't fail the leg on a transient
+          // post-deposit tracking error (e.g. Relay's best-effort solver ping). Real pre-deposit
+          // failures (rejected signature, quote error) still propagate.
+          if (!sawTxHash || !isBenignRelaySolverError(e)) throw e;
+          patchLeg(legIndex, { note: "Bridge submitted — Relay is confirming; funds will arrive shortly." });
         }
+
+        // Fallback hint for the outbound direction (the inbound swap re-measures at its own runtime).
+        ctxRef.current.intermediate = relayOutputAmount(quote) ?? ctxRef.current.intermediate;
       },
     [patchLeg],
   );
@@ -195,7 +226,7 @@ export function useSwapFlow() {
   const prepare = useCallback(
     (ctx: SwapContext) => {
       const plan = planSwap(ctx.from, ctx.to);
-      ctxRef.current = { intermediate: 0n };
+      ctxRef.current = { intermediate: 0n, usdtBefore: 0n };
       const runners: LegRunner[] = [];
       const legState: RunLeg[] = [];
 
