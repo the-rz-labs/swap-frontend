@@ -3,6 +3,9 @@
 A Relay-style cross-chain swap UI for the RZ ecosystem. **One side of every swap is always on BNB
 Chain** (one of the 17 RzSwap tokens); the other side can be any Relay-supported chain/token.
 
+> **Frontend devs:** see [`docs/RELAY_INTEGRATION.md`](docs/RELAY_INTEGRATION.md) for how the
+> Relay × RzSwap composition works and how to implement/extend it.
+
 ## How it works
 
 The app composes two primitives, with **USDT on BNB Chain as the hub**, minimizing transactions:
