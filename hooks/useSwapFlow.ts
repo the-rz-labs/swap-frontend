@@ -38,6 +38,8 @@ export type SwapContext = {
   slippageBps: number;
   address: Address;
   mode: SwapMode;
+  /** Correlation id passed to RzSwap.swap and emitted in the Swapped event (for backend matching). */
+  swapId: `0x${string}`;
 };
 
 type LegRunner = () => Promise<void>;
@@ -153,6 +155,7 @@ export function useSwapFlow() {
           functionName: "swap",
           args: [
             {
+              swapId: ctx.swapId,
               tokenIn: tokenIn.address,
               tokenOut: tokenOut.address,
               amountIn,

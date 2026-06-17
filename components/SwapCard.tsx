@@ -6,7 +6,7 @@ import { useAppKit, useAppKitAccount } from "@reown/appkit/react";
 import { ALL_TOKENS, USDT_BSC, CHAINS, isBscToken, isNative, tokenKey, type Token } from "@/lib/tokens";
 import { RZSWAP_CONFIGURED } from "@/lib/rzswap";
 import { planSwap, applySlippage, type SwapMode } from "@/lib/swapPlan";
-import { safeParseUnits, formatAmount, formatUsd } from "@/lib/format";
+import { safeParseUnits, formatAmount, formatUsd, randomSwapId } from "@/lib/format";
 import { useQuote } from "@/hooks/useQuote";
 import { useSwapFlow } from "@/hooks/useSwapFlow";
 import { useBalances } from "@/hooks/useBalances";
@@ -116,7 +116,9 @@ export function SwapCard() {
 
   function mainAction() {
     if (!isConnected || !address) return open();
-    if (flow.status === "idle") return flow.start({ from, to, amountIn, slippageBps, address: address as `0x${string}`, mode });
+    if (flow.status === "idle")
+      // swapId ideally comes from the backend; a client-side random id is used as a fallback.
+      return flow.start({ from, to, amountIn, slippageBps, address: address as `0x${string}`, mode, swapId: randomSwapId() });
     if (flow.status === "error") return flow.retry();
     if (flow.status === "done") {
       flow.reset();

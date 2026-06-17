@@ -18,6 +18,7 @@ export const RZSWAP_ABI = [
         name: "params",
         type: "tuple",
         components: [
+          { name: "swapId", type: "bytes32" },
           { name: "tokenIn", type: "address" },
           { name: "tokenOut", type: "address" },
           { name: "amountIn", type: "uint256" },
