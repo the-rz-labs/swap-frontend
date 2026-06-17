@@ -2,6 +2,7 @@
 /.next
 /out
 /build
+/.vercel
 .env
 .env.local
 *.tsbuildinfo

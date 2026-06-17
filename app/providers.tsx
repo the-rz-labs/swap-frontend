@@ -18,7 +18,11 @@ createAppKit({
   metadata: {
     name: "RzSwap",
     description: "Cross-chain swaps into the RZ ecosystem on BNB Chain",
-    url: typeof window !== "undefined" ? window.location.origin : "https://rzswap.app",
+    // Should match the deployed domain for WalletConnect verification. Set NEXT_PUBLIC_APP_URL in
+    // production; otherwise it resolves to the current origin at runtime.
+    url:
+      process.env.NEXT_PUBLIC_APP_URL ||
+      (typeof window !== "undefined" ? window.location.origin : "https://rzswap.app"),
     icons: ["https://avatars.githubusercontent.com/u/179229932"],
   },
   features: {

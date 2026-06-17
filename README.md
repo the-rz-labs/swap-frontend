@@ -46,6 +46,35 @@ npm run dev
 
 Open http://localhost:3000.
 
+## Deploy to Vercel
+
+This app lives in the **`frontend/` subdirectory** of the repo, so the one critical setting is the
+project **Root Directory**.
+
+1. **Import the repo** into Vercel (New Project → import this Git repo).
+2. **Set Root Directory = `frontend`** (Project → Settings → General → Root Directory). Vercel then
+   auto-detects Next.js — leave Framework/Build/Install commands as detected.
+3. **Add Environment Variables** (Project → Settings → Environment Variables), for all environments:
+
+   | Variable | Required | Value |
+   |---|---|---|
+   | `NEXT_PUBLIC_REOWN_PROJECT_ID` | ✅ | your Reown project id |
+   | `NEXT_PUBLIC_RZSWAP_ADDRESS` | ✅ | deployed RzSwap address on BSC |
+   | `NEXT_PUBLIC_APP_URL` | recommended | your Vercel URL, e.g. `https://rzswap.vercel.app` |
+   | `NEXT_PUBLIC_RELAY_SOURCE` | optional | your app domain |
+
+4. In the **Reown dashboard**, add your Vercel domain to the project's **allowed domains** (otherwise
+   WalletConnect connections are rejected).
+5. **Deploy.**
+
+Notes:
+- All `NEXT_PUBLIC_*` vars are **inlined at build time** — after changing any, trigger a redeploy.
+- Node is pinned to **20.x** (`.nvmrc` / `engines`).
+- No server secrets are used; everything is public client config.
+- The build runs `next lint`; a local root `.eslintrc.json` (`root: true`) keeps it self-contained.
+- RPC is handled by Reown's infra via your project id (no RPC env needed). For heavy traffic,
+  consider wiring dedicated BSC/ETH RPC transports into the `WagmiAdapter`.
+
 ## Key files
 
 | File | Purpose |
