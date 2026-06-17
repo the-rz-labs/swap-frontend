@@ -48,12 +48,10 @@ Open http://localhost:3000.
 
 ## Deploy to Vercel
 
-This app lives in the **`frontend/` subdirectory** of the repo, so the one critical setting is the
-project **Root Directory**.
-
 1. **Import the repo** into Vercel (New Project → import this Git repo).
-2. **Set Root Directory = `frontend`** (Project → Settings → General → Root Directory). Vercel then
-   auto-detects Next.js — leave Framework/Build/Install commands as detected.
+2. **Root Directory:** this standalone `swap-frontend` repo has the app at its root, so leave Root
+   Directory as the default (`.`). _(If you instead deploy from the `cross-chain-swap` monorepo, set
+   Root Directory = `frontend`.)_ Vercel auto-detects Next.js — leave the rest as detected.
 3. **Add Environment Variables** (Project → Settings → Environment Variables), for all environments:
 
    | Variable | Required | Value |
