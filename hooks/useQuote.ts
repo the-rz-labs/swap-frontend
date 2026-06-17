@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { BSC_CHAIN_ID, USDT_BSC, tokenKey, type Token } from "@/lib/tokens";
 import { resolveBestBscPath, bscUsdValue } from "@/lib/route";
 import { getRelayQuote, relayOutputAmount, relayMinimumOutput, relayUsd } from "@/lib/relay";
-import { classify } from "@/lib/swapPlan";
+import { classify, type SwapMode } from "@/lib/swapPlan";
 
 export type QuoteResult = {
   /** Final output in destination-token base units. */
@@ -16,7 +16,30 @@ export type QuoteResult = {
   outputUsd?: number;
 };
 
-async function computeQuote(from: Token, to: Token, amountIn: bigint, recipient?: string): Promise<QuoteResult> {
+async function computeQuote(
+  from: Token,
+  to: Token,
+  amountIn: bigint,
+  recipient: string | undefined,
+  mode: SwapMode,
+): Promise<QuoteResult> {
+  // Relay-direct: a single market quote from → to (Relay routes via its own DEX aggregation).
+  if (mode === "relay") {
+    if (!recipient) throw new Error("Connect your wallet to quote.");
+    const quote = await getRelayQuote({
+      fromChainId: from.chainId,
+      fromCurrency: from.address,
+      toChainId: to.chainId,
+      toCurrency: to.address,
+      amount: amountIn.toString(),
+      recipient,
+    });
+    const output = relayOutputAmount(quote);
+    if (output == null) throw new Error("Relay has no route for this pair.");
+    const { inUsd, outUsd } = relayUsd(quote);
+    return { output, inputUsd: inUsd, outputUsd: outUsd };
+  }
+
   const kind = classify(from, to);
 
   if (kind === "local") {
@@ -74,10 +97,10 @@ async function computeQuote(from: Token, to: Token, amountIn: bigint, recipient?
   return { output: amountOut, hubAmount: hubMin, inputUsd: inUsd, outputUsd };
 }
 
-export function useQuote(from: Token, to: Token, amountIn: bigint, recipient?: string) {
+export function useQuote(from: Token, to: Token, amountIn: bigint, recipient: string | undefined, mode: SwapMode) {
   return useQuery<QuoteResult>({
-    queryKey: ["quote", tokenKey(from), tokenKey(to), amountIn.toString(), recipient ?? "anon"],
-    queryFn: () => computeQuote(from, to, amountIn, recipient),
+    queryKey: ["quote", mode, tokenKey(from), tokenKey(to), amountIn.toString(), recipient ?? "anon"],
+    queryFn: () => computeQuote(from, to, amountIn, recipient, mode),
     enabled: amountIn > 0n && tokenKey(from) !== tokenKey(to),
     staleTime: 8_000,
     refetchInterval: 15_000,

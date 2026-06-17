@@ -1,5 +1,12 @@
 import { isBscToken, USDT_BSC, tokenKey, CHAIN_NAMES, type Token } from "./tokens";
 
+/**
+ * Routing mode:
+ *  - "rzswap": route the BSC leg through our RzSwap treasury contract (controlled pricing).
+ *  - "relay" : let Relay handle the entire swap via its own DEX aggregation (market pricing).
+ */
+export type SwapMode = "rzswap" | "relay";
+
 export type SwapKind = "local" | "inbound" | "outbound" | "invalid";
 
 export type LegKind = "relay" | "rzswap";
