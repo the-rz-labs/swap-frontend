@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { encodeFunctionData, type Address, type WalletClient } from "viem";
+import { type Address, type WalletClient } from "viem";
 import {
   readContract,
   writeContract,
@@ -13,7 +13,7 @@ import { wagmiConfig } from "@/lib/wagmi";
 import { BSC_CHAIN_ID, USDT_BSC, type Token } from "@/lib/tokens";
 import { RZSWAP_ABI, ERC20_ABI, RZSWAP_ADDRESS } from "@/lib/rzswap";
 import { resolveBestBscPath } from "@/lib/route";
-import { getRelayQuote, executeRelay, relayOutputAmount, relayMinimumOutput, type RelayCallTx } from "@/lib/relay";
+import { getRelayQuote, executeRelay, relayOutputAmount } from "@/lib/relay";
 import { isBenignRelaySolverError } from "@/lib/relayErrors";
 import { planSwap, applySlippage, type SwapMode } from "@/lib/swapPlan";
 
@@ -41,6 +41,8 @@ export type SwapContext = {
 };
 
 type LegRunner = () => Promise<void>;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Ensures the wallet is on `chainId`, switching if necessary. */
 async function ensureChain(chainId: number) {
@@ -118,11 +120,18 @@ export function useSwapFlow() {
         await ensureChain(BSC_CHAIN_ID);
         let amountIn: bigint;
         if (useIntermediate) {
-          const cur = await bscTokenBalance(USDT_BSC.address, ctx.address);
-          const delta = cur > ctxRef.current.usdtBefore ? cur - ctxRef.current.usdtBefore : 0n;
+          // The bridged USDT may land a moment after the bridge leg resolves — poll briefly for it,
+          // then swap the EXACT amount received (no leftover USDT change).
+          let delta = 0n;
+          for (let i = 0; i < 20; i++) {
+            const cur = await bscTokenBalance(USDT_BSC.address, ctx.address);
+            delta = cur > ctxRef.current.usdtBefore ? cur - ctxRef.current.usdtBefore : 0n;
+            if (delta > 0n) break;
+            await sleep(3000);
+          }
           amountIn = delta > 0n ? delta : ctxRef.current.intermediate;
           if (amountIn <= 0n) {
-            throw new Error("Bridged USDT not received yet — wait a moment, then confirm this step again.");
+            throw new Error("Bridged USDT not received yet — wait a moment, then retry this step.");
           }
         } else {
           amountIn = ctx.amountIn;
@@ -223,90 +232,6 @@ export function useSwapFlow() {
   );
 
   /**
-   * SINGLE-TRANSACTION inbound leg (remote → rz-token). Relay bridges the origin asset to USDT on
-   * BSC and, in the same fill, runs `approve(RzSwap)` + `RzSwap.swap(USDT → rz, receiver = user)`
-   * via its multicaller. The user signs only the origin deposit.
-   *
-   * The swap's amountIn is pinned to the bridge's GUARANTEED minimum USDT output (the multicaller is
-   * always delivered at least this), so the on-arrival swap never reverts for lack of balance; any
-   * surplus is refunded to the user by Relay. `refundOnOrigin` returns the user's funds on the
-   * source chain if the destination swap can't fill (e.g. treasury too low).
-   */
-  const makeInboundBridgeSwapLeg = useCallback(
-    (ctx: SwapContext, legIndex: number): LegRunner =>
-      async () => {
-        await ensureChain(ctx.from.chainId);
-        const wallet = (await getWalletClient(wagmiConfig, { chainId: ctx.from.chainId })) as WalletClient;
-
-        // 1) Preliminary quote (no destination call) to learn the guaranteed USDT delivered.
-        const prelim = await getRelayQuote({
-          fromChainId: ctx.from.chainId,
-          fromCurrency: ctx.from.address,
-          toChainId: BSC_CHAIN_ID,
-          toCurrency: USDT_BSC.address,
-          amount: ctx.amountIn.toString(),
-          recipient: ctx.address,
-          wallet,
-        });
-        const usdtMin = relayMinimumOutput(prelim) ?? relayOutputAmount(prelim);
-        if (usdtMin == null || usdtMin <= 0n) throw new Error("Could not quote the bridge output.");
-
-        // Builds a quote whose destination txs swap `swapAmountIn` USDT into the rz-token.
-        const build = async (swapAmountIn: bigint) => {
-          const { path, amountOut } = await resolveBestBscPath(swapAmountIn, USDT_BSC.address, ctx.to.address);
-          const minOut = applySlippage(amountOut, ctx.slippageBps);
-          const swapParams = {
-            tokenIn: USDT_BSC.address,
-            tokenOut: ctx.to.address,
-            amountIn: swapAmountIn,
-            minAmountOut: minOut,
-            receiver: ctx.address,
-            path,
-          };
-          const txs: RelayCallTx[] = [
-            {
-              to: USDT_BSC.address,
-              value: "0",
-              data: encodeFunctionData({ abi: ERC20_ABI, functionName: "approve", args: [RZSWAP_ADDRESS, swapAmountIn] }),
-            },
-            {
-              to: RZSWAP_ADDRESS,
-              value: "0",
-              data: encodeFunctionData({ abi: RZSWAP_ABI, functionName: "swap", args: [swapParams] }),
-            },
-          ];
-          const quote = await getRelayQuote({
-            fromChainId: ctx.from.chainId,
-            fromCurrency: ctx.from.address,
-            toChainId: BSC_CHAIN_ID,
-            toCurrency: USDT_BSC.address,
-            amount: ctx.amountIn.toString(),
-            recipient: ctx.address,
-            wallet,
-            txs,
-            refundOnOrigin: true,
-          });
-          return { quote, swapAmountIn };
-        };
-
-        // 2) Pin the swap input 1% under the guaranteed min to absorb destination-gas drift between
-        //    the plain and with-call quotes; re-pin once if the final min came in lower.
-        let attempt = await build((usdtMin * 99n) / 100n);
-        const finalMin = relayMinimumOutput(attempt.quote);
-        if (finalMin != null && finalMin < attempt.swapAmountIn) {
-          attempt = await build((finalMin * 99n) / 100n);
-        }
-
-        // 3) One signature: deposit on the origin chain; Relay fills + swaps on BSC.
-        await executeRelay(attempt.quote, wallet, (data) => {
-          const tx = data.txHashes?.[0];
-          if (tx) patchLeg(legIndex, { txHash: tx.txHash, chainId: tx.chainId });
-        });
-      },
-    [patchLeg],
-  );
-
-  /**
    * RELAY-DIRECT leg: Relay swaps from → to entirely via its own DEX aggregation (no RzSwap). Works
    * for every direction (cross-chain or same-chain). One signature on the origin chain.
    */
@@ -376,14 +301,13 @@ export function useSwapFlow() {
           makeRelayLeg(ctx, BSC_CHAIN_ID, USDT_BSC.address, ctx.to.chainId, ctx.to.address, !plan.hubIsEndpoint, false, idx),
         );
       } else if (plan.kind === "inbound") {
-        if (plan.hubIsEndpoint) {
-          // remote → USDT is a plain bridge, no on-chain swap leg.
-          legState.push({ key: "relay", label: `Bridge ${ctx.from.symbol} → USDT`, status: "pending", chainId: ctx.from.chainId });
-          runners.push(makeRelayLeg(ctx, ctx.from.chainId, ctx.from.address, BSC_CHAIN_ID, USDT_BSC.address, false, false, 0));
-        } else {
-          // Single transaction: bridge + RzSwap executed by Relay on arrival.
-          legState.push({ key: "relay", label: `Bridge ${ctx.from.symbol} → ${ctx.to.symbol} (1 tx)`, status: "pending", chainId: ctx.from.chainId });
-          runners.push(makeInboundBridgeSwapLeg(ctx, 0));
+        // Two steps: bridge to USDT on BSC, then swap the EXACT received USDT into the token (max
+        // output, no USDT change). The plain remote→USDT case has no second leg.
+        legState.push({ key: "relay", label: `Bridge ${ctx.from.symbol} → USDT`, status: "pending", chainId: ctx.from.chainId });
+        runners.push(makeRelayLeg(ctx, ctx.from.chainId, ctx.from.address, BSC_CHAIN_ID, USDT_BSC.address, false, true, 0));
+        if (!plan.hubIsEndpoint) {
+          legState.push({ key: "rzswap", label: `Swap USDT → ${ctx.to.symbol}`, status: "pending", chainId: BSC_CHAIN_ID });
+          runners.push(makeRzSwapLeg(ctx, USDT_BSC, ctx.to, true));
         }
       }
 
@@ -391,7 +315,7 @@ export function useSwapFlow() {
       setLegs(legState);
       setCurrent(0);
     },
-    [makeRzSwapLeg, makeRelayLeg, makeInboundBridgeSwapLeg, makeRelayDirectLeg],
+    [makeRzSwapLeg, makeRelayLeg, makeRelayDirectLeg],
   );
 
   // ── auto-run all legs sequentially (one click; wallet prompts in order) ────

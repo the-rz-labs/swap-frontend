@@ -3,7 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { BSC_CHAIN_ID, USDT_BSC, tokenKey, type Token } from "@/lib/tokens";
 import { resolveBestBscPath, bscUsdValue } from "@/lib/route";
-import { getRelayQuote, relayOutputAmount, relayMinimumOutput, relayUsd } from "@/lib/relay";
+import { getRelayQuote, relayOutputAmount, relayUsd } from "@/lib/relay";
 import { classify, type SwapMode } from "@/lib/swapPlan";
 
 export type QuoteResult = {
@@ -79,22 +79,17 @@ async function computeQuote(
     amount: amountIn.toString(),
     recipient,
   });
-  const hubExpected = relayOutputAmount(quote);
-  const hubMin = relayMinimumOutput(quote) ?? hubExpected;
-  if (hubExpected == null || hubMin == null) throw new Error("Relay returned no output amount.");
+  const hubAmount = relayOutputAmount(quote);
+  if (hubAmount == null) throw new Error("Relay returned no output amount.");
   const { inUsd, outUsd } = relayUsd(quote);
 
   // Plain bridge to USDT — the user receives ~expected, no on-arrival swap.
-  if (hubIsEndpoint) return { output: hubExpected, hubAmount: hubExpected, inputUsd: inUsd, outputUsd: outUsd };
+  if (hubIsEndpoint) return { output: hubAmount, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
 
-  // Bridge-and-execute: the on-arrival swap is pinned to the bridge's GUARANTEED MINIMUM (×0.99),
-  // so quote the RZ output from that exact amount — matching execution. Quoting from `hubExpected`
-  // would overstate what the user actually receives (the bug this fixes).
-  const swapIn = (hubMin * 99n) / 100n;
-  const { amountOut } = await resolveBestBscPath(swapIn, USDT_BSC.address, to.address);
-  // Scale the output USD to the minimum so the $ value tracks the shown amount.
-  const outputUsd = outUsd != null && hubExpected > 0n ? (outUsd * Number(hubMin)) / Number(hubExpected) : outUsd;
-  return { output: amountOut, hubAmount: hubMin, inputUsd: inUsd, outputUsd };
+  // 2-step flow: the second leg swaps the EXACT USDT actually bridged (≈ expected) entirely into the
+  // token, so quote the output from the expected bridged amount.
+  const { amountOut } = await resolveBestBscPath(hubAmount, USDT_BSC.address, to.address);
+  return { output: amountOut, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
 }
 
 export function useQuote(from: Token, to: Token, amountIn: bigint, recipient: string | undefined, mode: SwapMode) {

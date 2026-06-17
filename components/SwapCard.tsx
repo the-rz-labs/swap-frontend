@@ -134,7 +134,7 @@ export function SwapCard() {
     if (flow.status === "done") return "Swap complete ✓ — start new";
     if (flow.status === "error") return "Retry";
     if (mode === "relay") return "Swap · 1 transaction";
-    return plan.kind === "inbound" && !plan.hubIsEndpoint ? "Swap · 1 transaction" : "Swap";
+    return "Swap";
   })();
 
   const buttonDisabled = flow.status === "running" || (flow.status === "idle" && !canStart);
@@ -284,7 +284,7 @@ export function SwapCard() {
       )}
       {flow.status === "idle" && amountIn > 0n && mode === "rzswap" && plan.kind === "inbound" && !plan.hubIsEndpoint && (
         <p className="mt-2 text-center text-xs text-muted">
-          Single transaction: Relay bridges to {CHAINS[to.chainId]?.shortName} and runs the RzSwap swap in the same fill.
+          Two steps: Relay bridges to USDT, then RzSwap converts all of it to {to.symbol} — max {to.symbol}, no leftover USDT.
         </p>
       )}
 

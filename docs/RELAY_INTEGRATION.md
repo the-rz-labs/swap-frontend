@@ -18,8 +18,12 @@ Relay-supported chain/token. The UI enforces this.
 | Flow | Example | Transactions | Who does what |
 |---|---|---|---|
 | **Local** | USDT(BSC) → CAR(BSC) | **1 tx** | RzSwap only |
-| **Inbound** | ETH(Ethereum) → CAR(BSC) | **1 tx** | Relay bridges ETH→USDT **and** runs `RzSwap.swap` in the same fill |
+| **Inbound** | ETH(Ethereum) → CAR(BSC) | **2 tx, auto** | Relay bridges ETH→USDT, then RzSwap swaps the **exact** USDT received → max CAR, no leftover |
 | **Outbound** | CAR(BSC) → ETH(Ethereum) | **2 tx, auto** | RzSwap: CAR→USDT, then Relay: USDT→ETH (run back-to-back) |
+
+> There is also a **Relay** routing mode (toggle in the UI) where Relay handles the *entire* swap via
+> its own DEX aggregation — one transaction, any direction, no RzSwap. See `makeRelayDirectLeg`. The
+> table above is the **RzSwap** (treasury) mode.
 
 Direction is classified purely from the two selected tokens — see `lib/swapPlan.ts` → `classify()` /
 `planSwap()`. `hubIsEndpoint` is true when the BSC side *is* USDT (then there's no RzSwap leg — it's
@@ -73,36 +77,32 @@ on an interval (react-query).
 The flow builds an ordered list of **legs** and runs them sequentially from one click (`start()`),
 with `retry()` resuming from a failed leg. Each leg switches the wallet to the right chain itself.
 
-### 4a. Inbound = **single transaction** (`makeInboundBridgeSwapLeg`)
+### 4a. Inbound = **2 tx, auto-orchestrated** (max output, no leftover)
 
-Relay's quote accepts a `txs` array of destination-chain calls executed by its multicaller after the
-bridge fills. We append `approve(USDT→RzSwap)` + `RzSwap.swap(USDT→token, receiver = user)`:
+Two legs, run back-to-back from one click:
+
+1. `makeRelayLeg(remote → USDT, measureBscUsdt = true)` — bridges to USDT on BSC and snapshots the
+   user's USDT balance (`usdtBefore`) before the fill.
+2. `makeRzSwapLeg(USDT → token, useIntermediate = true)` — **polls** the USDT balance until the
+   bridged funds land, computes the **exact amount received** (`current − usdtBefore`), and swaps
+   **all of it** into the token. Result: maximum token output, **no leftover USDT change**.
 
 ```ts
-// 1. plain quote → guaranteed USDT delivered on BSC
-const usdtMin = relayMinimumOutput(prelimQuote);
-
-// 2. pin the swap input UNDER the guaranteed min so the on-arrival swap can never revert
-//    for lack of balance; surplus is refunded to the user by Relay.
-const swapAmountIn = (usdtMin * 99n) / 100n;
-const { path, amountOut } = await resolveBestBscPath(swapAmountIn, USDT, token);
-
-const txs = [
-  { to: USDT,   value: "0", data: encodeFunctionData({ abi: ERC20_ABI,  functionName: "approve", args: [RZSWAP, swapAmountIn] }) },
-  { to: RZSWAP, value: "0", data: encodeFunctionData({ abi: RZSWAP_ABI, functionName: "swap",    args: [{ tokenIn: USDT, tokenOut: token, amountIn: swapAmountIn, minAmountOut: applySlippage(amountOut, slippageBps), receiver: user, path }] }) },
-];
-
-const quote = await getRelayQuote({ /* remote → USDT */, txs, refundOnOrigin: true });
-await executeRelay(quote, wallet, onProgress); // ONE signature: the origin deposit
+// leg 2, useIntermediate: wait for the bridged USDT, then swap the exact amount received
+let delta = 0n;
+for (let i = 0; i < 20; i++) {
+  const cur = await bscTokenBalance(USDT, user);
+  delta = cur > usdtBefore ? cur - usdtBefore : 0n;
+  if (delta > 0n) break;
+  await sleep(3000);
+}
+// swap `delta` USDT → token (slippage floor from getOutputAmount)
 ```
 
-Key points:
-- **Amount pinning:** the swap input must be ≤ the USDT the multicaller actually receives. Use
-  `relayMinimumOutput`; if the with-`txs` quote's min comes back lower, re-pin once. Surplus dust is
-  refunded to the user.
-- **`refundOnOrigin: true`** — if the on-arrival swap can't fill (e.g. treasury too low), Relay
-  refunds the user on the **source** chain. Fail-safe: worst case is "no swap," never lost funds.
-- The user receives the RZ token directly; no second tx.
+> A previous version used Relay's `txs` to do this in a *single* transaction (bridge-and-execute),
+> but it had to pin the swap to the bridge's guaranteed minimum, leaving the surplus as USDT change.
+> The 2-tx flow swaps the **actual** received amount instead — one extra signature, max output.
+> If you ever want the 1-tx variant back, see git history (`makeInboundBridgeSwapLeg`).
 
 ### 4b. Outbound = **2 tx, auto-orchestrated**
 
