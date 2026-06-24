@@ -59,7 +59,12 @@ export async function resolveBestBscPath(amountIn: bigint, from: Address, to: Ad
     if (out != null && (!best || out > best.amountOut)) best = { path: candidates[i], amountOut: out };
   });
 
-  if (!best) throw new Error("No PancakeSwap route with liquidity for this pair.");
+  if (!best) {
+    throw new Error(
+      "No price available for this pair — low liquidity, or the AMM price deviates too far from the " +
+        "oracle (the v1 PricingSystem caps deviation). Installing the OraclePricer prices these tokens.",
+    );
+  }
   return best;
 }
 
