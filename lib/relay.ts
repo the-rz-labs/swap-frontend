@@ -92,6 +92,44 @@ export function relayUsd(quote: Execute): { inUsd?: number; outUsd?: number } {
   };
 }
 
+/**
+ * SELL helper: quotes a USDT-out bridge whose ON-CHAIN depositor is `depositor` (our
+ * RelayDepositAdapter), and returns the depository call to execute plus the guaranteed minimum
+ * output. The adapter runs this calldata after the RzSwap swap, so the sell is one approve + one
+ * call. Uses the raw API (not the SDK) so we can set `user` to a contract.
+ */
+export type RelaySellDeposit = { depository: `0x${string}`; data: `0x${string}`; value: string };
+
+export async function getRelaySellDeposit(input: {
+  depositor: string;
+  recipient: string;
+  originCurrency: string; // USDT on BSC
+  amount: string; // base units the adapter will deposit (use the swap's guaranteed minimum)
+  toChainId: number;
+  toCurrency: string;
+}): Promise<RelaySellDeposit> {
+  const res = await fetch("https://api.relay.link/quote", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user: input.depositor,
+      recipient: input.recipient,
+      originChainId: 56,
+      destinationChainId: input.toChainId,
+      originCurrency: input.originCurrency,
+      destinationCurrency: input.toCurrency,
+      amount: input.amount,
+      tradeType: "EXACT_INPUT",
+    }),
+  });
+  const j = await res.json();
+  if (!res.ok || j?.message) throw new Error(`Relay sell quote failed: ${j?.message ?? res.status}`);
+  const dep = (j.steps ?? []).find((s: { id?: string }) => s.id === "deposit");
+  const item = dep?.items?.[0]?.data;
+  if (!item?.to || !item?.data) throw new Error("Relay returned no deposit step for the sell.");
+  return { depository: item.to, data: item.data, value: item.value ?? "0" };
+}
+
 /** True once every step of an executed quote is complete. */
 export function relayIsComplete(data: ProgressData | Execute): boolean {
   const steps = data.steps ?? [];

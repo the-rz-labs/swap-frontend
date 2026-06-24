@@ -9,7 +9,7 @@
  *
  * See docs/RELAY_INTEGRATION.md (repo root) for the full flow + Relay API specifics.
  */
-import { type Address, type Hex, encodeFunctionData } from "viem";
+import { type Address, type Hex, encodeFunctionData, encodeAbiParameters } from "viem";
 import { USDT_BSC, BSC_CHAIN_ID } from "./tokens";
 import type { RelayCallTx } from "./relay";
 
@@ -125,3 +125,15 @@ export function buildSellCrossChainTx(args: {
 }
 
 export const BUY_DESTINATION_CHAIN = BSC_CHAIN_ID;
+
+/**
+ * Encodes the SellHandler `extraData` = abi.encode(depository, refundTo, depositCalldata) consumed
+ * by RelayDepositAdapter. `depository`/`depositCalldata` come from getRelaySellDeposit; `refundTo`
+ * is the user's BSC address (receives any small drift between the swap output and the bridged amount).
+ */
+export function buildSellExtraData(depository: Address, refundTo: Address, depositCalldata: Hex): Hex {
+  return encodeAbiParameters(
+    [{ type: "address" }, { type: "address" }, { type: "bytes" }],
+    [depository, refundTo, depositCalldata],
+  );
+}
