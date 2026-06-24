@@ -1,11 +1,7 @@
 import { isBscToken, USDT_BSC, tokenKey, CHAIN_NAMES, type Token } from "./tokens";
 
-/**
- * Routing mode:
- *  - "rzswap": route the BSC leg through our RzSwap treasury contract (controlled pricing).
- *  - "relay" : let Relay handle the entire swap via its own DEX aggregation (market pricing).
- */
-export type SwapMode = "rzswap" | "relay";
+// Every swap routes the BSC leg through the RzSwap treasury (controlled pricing); Relay only moves
+// USDT to/from BNB Chain. There is no "let Relay price it" mode — ecosystem tokens are priced by us.
 
 export type SwapKind = "local" | "inbound" | "outbound" | "invalid";
 

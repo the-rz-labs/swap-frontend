@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { BSC_CHAIN_ID, USDT_BSC, tokenKey, type Token } from "@/lib/tokens";
 import { resolveBestBscPath, bscUsdValue } from "@/lib/route";
 import { getRelayQuote, relayOutputAmount, relayUsd } from "@/lib/relay";
-import { classify, type SwapMode } from "@/lib/swapPlan";
+import { classify } from "@/lib/swapPlan";
 
 export type QuoteResult = {
   /** Final output in destination-token base units. */
@@ -21,25 +21,7 @@ async function computeQuote(
   to: Token,
   amountIn: bigint,
   recipient: string | undefined,
-  mode: SwapMode,
 ): Promise<QuoteResult> {
-  // Relay-direct: a single market quote from → to (Relay routes via its own DEX aggregation).
-  if (mode === "relay") {
-    if (!recipient) throw new Error("Connect your wallet to quote.");
-    const quote = await getRelayQuote({
-      fromChainId: from.chainId,
-      fromCurrency: from.address,
-      toChainId: to.chainId,
-      toCurrency: to.address,
-      amount: amountIn.toString(),
-      recipient,
-    });
-    const output = relayOutputAmount(quote);
-    if (output == null) throw new Error("Relay has no route for this pair.");
-    const { inUsd, outUsd } = relayUsd(quote);
-    return { output, inputUsd: inUsd, outputUsd: outUsd };
-  }
-
   const kind = classify(from, to);
 
   if (kind === "local") {
@@ -86,16 +68,16 @@ async function computeQuote(
   // Plain bridge to USDT — the user receives ~expected, no on-arrival swap.
   if (hubIsEndpoint) return { output: hubAmount, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
 
-  // 2-step flow: the second leg swaps the EXACT USDT actually bridged (≈ expected) entirely into the
-  // token, so quote the output from the expected bridged amount.
+  // Buy: the fill swaps the bridged USDT into the token via RzSwap, so quote the token output from
+  // the expected bridged USDT amount.
   const { amountOut } = await resolveBestBscPath(hubAmount, USDT_BSC.address, to.address);
   return { output: amountOut, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
 }
 
-export function useQuote(from: Token, to: Token, amountIn: bigint, recipient: string | undefined, mode: SwapMode) {
+export function useQuote(from: Token, to: Token, amountIn: bigint, recipient: string | undefined) {
   return useQuery<QuoteResult>({
-    queryKey: ["quote", mode, tokenKey(from), tokenKey(to), amountIn.toString(), recipient ?? "anon"],
-    queryFn: () => computeQuote(from, to, amountIn, recipient, mode),
+    queryKey: ["quote", tokenKey(from), tokenKey(to), amountIn.toString(), recipient ?? "anon"],
+    queryFn: () => computeQuote(from, to, amountIn, recipient),
     enabled: amountIn > 0n && tokenKey(from) !== tokenKey(to),
     staleTime: 8_000,
     refetchInterval: 15_000,

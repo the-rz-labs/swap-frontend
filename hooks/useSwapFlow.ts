@@ -15,7 +15,7 @@ import { RZSWAP_ABI, ERC20_ABI, RZSWAP_ADDRESS } from "@/lib/rzswap";
 import { resolveBestBscPath } from "@/lib/route";
 import { getRelayQuote, executeRelay, relayOutputAmount, relayMinimumOutput } from "@/lib/relay";
 import { isBenignRelaySolverError } from "@/lib/relayErrors";
-import { planSwap, applySlippage, type SwapMode } from "@/lib/swapPlan";
+import { planSwap, applySlippage } from "@/lib/swapPlan";
 import { buildBuyFulfillTx, BRIDGE_SWAP_HANDLER, HANDLERS_CONFIGURED } from "@/lib/handlers";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
@@ -38,7 +38,6 @@ export type SwapContext = {
   amountIn: bigint;
   slippageBps: number;
   address: Address;
-  mode: SwapMode;
   /** Correlation id passed to RzSwap.swap and emitted in the Swapped event (for backend matching). */
   swapId: `0x${string}`;
 };
@@ -305,43 +304,6 @@ export function useSwapFlow() {
     [patchLeg],
   );
 
-  /**
-   * RELAY-DIRECT leg: Relay swaps from → to entirely via its own DEX aggregation (no RzSwap). Works
-   * for every direction (cross-chain or same-chain). One signature on the origin chain.
-   */
-  const makeRelayDirectLeg = useCallback(
-    (ctx: SwapContext, legIndex: number): LegRunner =>
-      async () => {
-        await ensureChain(ctx.from.chainId);
-        const wallet = (await getWalletClient(wagmiConfig, { chainId: ctx.from.chainId })) as WalletClient;
-
-        const quote = await getRelayQuote({
-          fromChainId: ctx.from.chainId,
-          fromCurrency: ctx.from.address,
-          toChainId: ctx.to.chainId,
-          toCurrency: ctx.to.address,
-          amount: ctx.amountIn.toString(),
-          recipient: ctx.address,
-          wallet,
-        });
-
-        let sawTxHash = false;
-        try {
-          await executeRelay(quote, wallet, (data) => {
-            const tx = data.txHashes?.[0];
-            if (tx) {
-              sawTxHash = true;
-              patchLeg(legIndex, { txHash: tx.txHash, chainId: tx.chainId });
-            }
-          });
-        } catch (e) {
-          if (!sawTxHash || !isBenignRelaySolverError(e)) throw e;
-          patchLeg(legIndex, { note: "Submitted — Relay is confirming the swap." });
-        }
-      },
-    [patchLeg],
-  );
-
   // ── prepare ─────────────────────────────────────────────────────────────
 
   const prepare = useCallback(
@@ -351,16 +313,7 @@ export function useSwapFlow() {
       const runners: LegRunner[] = [];
       const legState: RunLeg[] = [];
 
-      if (ctx.mode === "relay") {
-        // Relay handles the whole swap directly — one leg, any direction.
-        legState.push({
-          key: "relay",
-          label: `Swap ${ctx.from.symbol} → ${ctx.to.symbol} via Relay`,
-          status: "pending",
-          chainId: ctx.from.chainId,
-        });
-        runners.push(makeRelayDirectLeg(ctx, 0));
-      } else if (plan.kind === "local") {
+      if (plan.kind === "local") {
         legState.push({ key: "rzswap", label: `Swap ${ctx.from.symbol} → ${ctx.to.symbol}`, status: "pending", chainId: BSC_CHAIN_ID });
         runners.push(makeRzSwapLeg(ctx, ctx.from, ctx.to, false));
       } else if (plan.kind === "outbound") {
@@ -390,7 +343,7 @@ export function useSwapFlow() {
       setLegs(legState);
       setCurrent(0);
     },
-    [makeRzSwapLeg, makeRelayLeg, makeRelayBuyLeg, makeRelayDirectLeg],
+    [makeRzSwapLeg, makeRelayLeg, makeRelayBuyLeg],
   );
 
   // ── auto-run all legs sequentially (one click; wallet prompts in order) ────

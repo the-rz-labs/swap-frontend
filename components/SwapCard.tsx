@@ -3,9 +3,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { formatUnits, parseEther } from "viem";
 import { useAppKit, useAppKitAccount } from "@reown/appkit/react";
-import { ALL_TOKENS, USDT_BSC, CHAINS, isBscToken, isNative, tokenKey, type Token } from "@/lib/tokens";
+import { ALL_TOKENS, USDT_BSC, isBscToken, isNative, tokenKey, type Token } from "@/lib/tokens";
 import { RZSWAP_CONFIGURED } from "@/lib/rzswap";
-import { planSwap, applySlippage, type SwapMode } from "@/lib/swapPlan";
+import { planSwap, applySlippage } from "@/lib/swapPlan";
 import { safeParseUnits, formatAmount, formatUsd, randomSwapId } from "@/lib/format";
 import { useQuote } from "@/hooks/useQuote";
 import { useSwapFlow } from "@/hooks/useSwapFlow";
@@ -47,14 +47,9 @@ export function SwapCard() {
   const [amount, setAmount] = useState("");
   const [slippageBps, setSlippageBps] = useState(100);
   const [picker, setPicker] = useState<"from" | "to" | null>(null);
-  const [mode, setMode] = useState<SwapMode>("rzswap");
 
   const flow = useSwapFlow();
 
-  function selectMode(m: SwapMode) {
-    flow.reset();
-    setMode(m);
-  }
   const { data: balances } = useBalances(ALL_TOKENS, address ?? undefined);
 
   // Invariant: exactly one side must be a BNB Chain token.
@@ -82,12 +77,9 @@ export function SwapCard() {
   const debouncedAmountIn = useDebounced(amountIn, 400);
 
   const plan = useMemo(() => planSwap(from, to), [from, to]);
-  const quote = useQuote(from, to, debouncedAmountIn, address ?? undefined, mode);
+  const quote = useQuote(from, to, debouncedAmountIn, address ?? undefined);
 
-  const routeDetail =
-    mode === "relay"
-      ? `${from.symbol} (${CHAINS[from.chainId]?.shortName}) → ${to.symbol} (${CHAINS[to.chainId]?.shortName}) via Relay`
-      : plan.legs.map((l) => l.detail).join("  →  ") || "—";
+  const routeDetail = plan.legs.map((l) => l.detail).join("  →  ") || "—";
 
   const output = quote.data?.output;
   const minReceived = output != null ? applySlippage(output, slippageBps) : undefined;
@@ -108,7 +100,7 @@ export function SwapCard() {
   }
 
   const rzswapNeeded = plan.legs.some((l) => l.kind === "rzswap") || (plan.kind === "inbound" && !plan.hubIsEndpoint);
-  const blockedByConfig = mode === "rzswap" && rzswapNeeded && !RZSWAP_CONFIGURED;
+  const blockedByConfig = rzswapNeeded && !RZSWAP_CONFIGURED;
   const insufficient = fromBal != null && amountIn > fromBal;
 
   const canStart =
@@ -118,7 +110,7 @@ export function SwapCard() {
     if (!isConnected || !address) return open();
     if (flow.status === "idle")
       // swapId ideally comes from the backend; a client-side random id is used as a fallback.
-      return flow.start({ from, to, amountIn, slippageBps, address: address as `0x${string}`, mode, swapId: randomSwapId() });
+      return flow.start({ from, to, amountIn, slippageBps, address: address as `0x${string}`, swapId: randomSwapId() });
     if (flow.status === "error") return flow.retry();
     if (flow.status === "done") {
       flow.reset();
@@ -135,7 +127,6 @@ export function SwapCard() {
     if (flow.status === "running") return "Swapping…";
     if (flow.status === "done") return "Swap complete ✓ — start new";
     if (flow.status === "error") return "Retry";
-    if (mode === "relay") return "Swap · 1 transaction";
     return "Swap";
   })();
 
@@ -145,22 +136,6 @@ export function SwapCard() {
     <div className="w-full max-w-md rounded-2xl border border-border bg-panel p-3 shadow-2xl sm:p-4">
       <div className="mb-3 flex items-center justify-between gap-2 px-1">
         <h2 className="text-sm font-semibold text-muted">Swap</h2>
-        <div className="flex rounded-xl bg-bg/60 p-0.5 text-xs font-semibold">
-          <button
-            onClick={() => selectMode("rzswap")}
-            title="Route the BSC leg through the RzSwap treasury (controlled pricing)"
-            className={`rounded-lg px-3 py-1.5 transition-colors ${mode === "rzswap" ? "bg-accent text-white" : "text-muted hover:text-white"}`}
-          >
-            RzSwap
-          </button>
-          <button
-            onClick={() => selectMode("relay")}
-            title="Let Relay handle the whole swap via its DEX aggregation (market pricing, 1 tx)"
-            className={`rounded-lg px-3 py-1.5 transition-colors ${mode === "relay" ? "bg-accent text-white" : "text-muted hover:text-white"}`}
-          >
-            Relay
-          </button>
-        </div>
       </div>
 
       {/* FROM */}
@@ -281,12 +256,9 @@ export function SwapCard() {
       {flow.status === "running" && flow.legs.length > 1 && (
         <p className="mt-2 text-center text-xs text-muted">Approve each wallet prompt as it appears — steps run automatically.</p>
       )}
-      {flow.status === "idle" && amountIn > 0n && mode === "relay" && (
-        <p className="mt-2 text-center text-xs text-muted">Market price via Relay · single transaction · RzSwap not used.</p>
-      )}
-      {flow.status === "idle" && amountIn > 0n && mode === "rzswap" && plan.kind === "inbound" && !plan.hubIsEndpoint && (
+      {flow.status === "idle" && amountIn > 0n && plan.kind === "inbound" && !plan.hubIsEndpoint && (
         <p className="mt-2 text-center text-xs text-muted">
-          Two steps: Relay bridges to USDT, then RzSwap converts all of it to {to.symbol} — max {to.symbol}, no leftover USDT.
+          One signature: Relay bridges to USDT and swaps it into {to.symbol} on BNB Chain (USDT back if it can&apos;t fill).
         </p>
       )}
 
