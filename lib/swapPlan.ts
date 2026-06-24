@@ -101,13 +101,17 @@ export function planSwap(from: Token, to: Token): SwapPlan {
       legs: [{ kind: "relay", title: "Bridge to BNB Chain", detail: `${from.symbol} (${remoteChain}) → USDT (BNB) via Relay` }],
     };
   }
-  // Two steps: Relay bridges to USDT on BNB Chain, then RzSwap converts the full amount to the token.
+  // ONE signature: Relay bridges to USDT delivered to the handler on BNB Chain and, in the same
+  // fill, calls fulfill() which swaps it into the token via RzSwap (USDT fallback on failure).
   return {
     kind,
     hubIsEndpoint: false,
     legs: [
-      { kind: "relay", title: "Bridge to BNB Chain", detail: `${from.symbol} (${remoteChain}) → USDT (BNB) via Relay` },
-      { kind: "rzswap", title: "Swap on BNB Chain", detail: `USDT → ${to.symbol} via RzSwap` },
+      {
+        kind: "relay",
+        title: `Buy ${to.symbol}`,
+        detail: `${from.symbol} (${remoteChain}) → ${to.symbol} (BNB): bridge + swap, one signature`,
+      },
     ],
   };
 }

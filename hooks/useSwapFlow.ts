@@ -13,9 +13,10 @@ import { wagmiConfig } from "@/lib/wagmi";
 import { BSC_CHAIN_ID, USDT_BSC, type Token } from "@/lib/tokens";
 import { RZSWAP_ABI, ERC20_ABI, RZSWAP_ADDRESS } from "@/lib/rzswap";
 import { resolveBestBscPath } from "@/lib/route";
-import { getRelayQuote, executeRelay, relayOutputAmount } from "@/lib/relay";
+import { getRelayQuote, executeRelay, relayOutputAmount, relayMinimumOutput } from "@/lib/relay";
 import { isBenignRelaySolverError } from "@/lib/relayErrors";
 import { planSwap, applySlippage, type SwapMode } from "@/lib/swapPlan";
+import { buildBuyFulfillTx, BRIDGE_SWAP_HANDLER, HANDLERS_CONFIGURED } from "@/lib/handlers";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
 
@@ -235,6 +236,76 @@ export function useSwapFlow() {
   );
 
   /**
+   * BUY leg (inbound, 1 signature): Relay bridges the user's asset to USDT delivered to the
+   * BridgeSwapHandler on BSC AND, in the same fill, calls fulfill() which swaps that USDT into the
+   * target token via RzSwap and sends it to the user. On any failure the handler delivers USDT to
+   * the user instead (fallback). Replaces the old bridge-then-swap 2-step.
+   */
+  const makeRelayBuyLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        if (!HANDLERS_CONFIGURED) {
+          throw new Error("Cross-chain buy is not configured (set NEXT_PUBLIC_BRIDGE_SWAP_HANDLER).");
+        }
+        await ensureChain(ctx.from.chainId);
+        const wallet = (await getWalletClient(wagmiConfig, { chainId: ctx.from.chainId })) as WalletClient;
+
+        // 1. Estimate the USDT that will be delivered to the handler — use the GUARANTEED minimum so
+        //    the token floor below stays safe even if the bridge delivers a touch less than quoted.
+        const estimate = await getRelayQuote({
+          fromChainId: ctx.from.chainId,
+          fromCurrency: ctx.from.address,
+          toChainId: BSC_CHAIN_ID,
+          toCurrency: USDT_BSC.address,
+          amount: ctx.amountIn.toString(),
+          recipient: BRIDGE_SWAP_HANDLER,
+          wallet,
+        });
+        const minUsdt = relayMinimumOutput(estimate) ?? relayOutputAmount(estimate);
+        if (!minUsdt || minUsdt <= 0n) throw new Error("Could not estimate the bridged USDT amount.");
+
+        // 2. Compute the token floor for that USDT via RzSwap's pricing path.
+        const { path, amountOut: quotedToken } = await resolveBestBscPath(minUsdt, USDT_BSC.address, ctx.to.address);
+        const minOut = applySlippage(quotedToken, ctx.slippageBps);
+
+        // 3. Quote bridge → USDT (to the handler) WITH the fulfill destination call, then execute.
+        const fulfillTx = buildBuyFulfillTx({
+          swapId: ctx.swapId,
+          tokenOut: ctx.to.address,
+          minAmountOut: minOut,
+          path,
+          user: ctx.address,
+        });
+        const quote = await getRelayQuote({
+          fromChainId: ctx.from.chainId,
+          fromCurrency: ctx.from.address,
+          toChainId: BSC_CHAIN_ID,
+          toCurrency: USDT_BSC.address,
+          amount: ctx.amountIn.toString(),
+          recipient: BRIDGE_SWAP_HANDLER,
+          txs: [fulfillTx],
+          refundOnOrigin: true,
+          wallet,
+        });
+
+        let sawTxHash = false;
+        try {
+          await executeRelay(quote, wallet, (data) => {
+            const tx = data.txHashes?.[0];
+            if (tx) {
+              sawTxHash = true;
+              patchLeg(legIndex, { txHash: tx.txHash, chainId: tx.chainId });
+            }
+          });
+        } catch (e) {
+          if (!sawTxHash || !isBenignRelaySolverError(e)) throw e;
+          patchLeg(legIndex, { note: "Submitted — Relay is bridging and swapping into the token on BNB Chain." });
+        }
+      },
+    [patchLeg],
+  );
+
+  /**
    * RELAY-DIRECT leg: Relay swaps from → to entirely via its own DEX aggregation (no RzSwap). Works
    * for every direction (cross-chain or same-chain). One signature on the origin chain.
    */
@@ -304,13 +375,14 @@ export function useSwapFlow() {
           makeRelayLeg(ctx, BSC_CHAIN_ID, USDT_BSC.address, ctx.to.chainId, ctx.to.address, !plan.hubIsEndpoint, false, idx),
         );
       } else if (plan.kind === "inbound") {
-        // Two steps: bridge to USDT on BSC, then swap the EXACT received USDT into the token (max
-        // output, no USDT change). The plain remote→USDT case has no second leg.
-        legState.push({ key: "relay", label: `Bridge ${ctx.from.symbol} → USDT`, status: "pending", chainId: ctx.from.chainId });
-        runners.push(makeRelayLeg(ctx, ctx.from.chainId, ctx.from.address, BSC_CHAIN_ID, USDT_BSC.address, false, true, 0));
-        if (!plan.hubIsEndpoint) {
-          legState.push({ key: "rzswap", label: `Swap USDT → ${ctx.to.symbol}`, status: "pending", chainId: BSC_CHAIN_ID });
-          runners.push(makeRzSwapLeg(ctx, USDT_BSC, ctx.to, true));
+        if (plan.hubIsEndpoint) {
+          // remote → USDT on BSC, delivered straight to the user. No swap leg.
+          legState.push({ key: "relay", label: `Bridge ${ctx.from.symbol} → USDT`, status: "pending", chainId: ctx.from.chainId });
+          runners.push(makeRelayLeg(ctx, ctx.from.chainId, ctx.from.address, BSC_CHAIN_ID, USDT_BSC.address, false, false, 0));
+        } else {
+          // ONE signature: bridge → USDT to the handler + fulfill (swap to token) atomically on BSC.
+          legState.push({ key: "buy", label: `Buy ${ctx.to.symbol} (bridge + swap)`, status: "pending", chainId: ctx.from.chainId });
+          runners.push(makeRelayBuyLeg(ctx, 0));
         }
       }
 
@@ -318,7 +390,7 @@ export function useSwapFlow() {
       setLegs(legState);
       setCurrent(0);
     },
-    [makeRzSwapLeg, makeRelayLeg, makeRelayDirectLeg],
+    [makeRzSwapLeg, makeRelayLeg, makeRelayBuyLeg, makeRelayDirectLeg],
   );
 
   // ── auto-run all legs sequentially (one click; wallet prompts in order) ────
