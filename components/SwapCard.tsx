@@ -3,7 +3,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { formatUnits, parseEther } from "viem";
 import { useAppKit, useAppKitAccount } from "@reown/appkit/react";
-import { ALL_TOKENS, USDT_BSC, isBscToken, isNative, tokenKey, type Token } from "@/lib/tokens";
+import { ALL_TOKENS, USDT_BSC, isBscToken, isNative, isTronToken, tokenKey, type Token } from "@/lib/tokens";
+import { isTronAddress } from "@/lib/tron/tronAddress";
+import { friendlyRelayError, isAmountTooSmallError } from "@/lib/relayErrors";
 import { RZSWAP_CONFIGURED } from "@/lib/rzswap";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
 import { safeParseUnits, formatAmount, formatUsd, randomSwapId } from "@/lib/format";
@@ -47,6 +49,15 @@ export function SwapCard() {
   const [amount, setAmount] = useState("");
   const [slippageBps, setSlippageBps] = useState(100);
   const [picker, setPicker] = useState<"from" | "to" | null>(null);
+  // Destination address on a non-EVM target (Tron). EVM targets use the connected wallet.
+  const [destAddress, setDestAddress] = useState("");
+
+  // Phase 1 supports selling TO Tron only; buying FROM Tron (source signing) is Phase 2. Hide Tron in
+  // the "from" picker until then so users can't pick an unsupported source.
+  const fromTokens = useMemo(() => ALL_TOKENS.filter((t) => !isTronToken(t)), []);
+  const tronDest = isTronToken(to);
+  const tronSource = isTronToken(from); // buying FROM Tron is Phase 2 (needs a Tron wallet)
+  const destValid = !tronDest || isTronAddress(destAddress.trim());
 
   const flow = useSwapFlow();
 
@@ -76,8 +87,11 @@ export function SwapCard() {
   const amountIn = useMemo(() => safeParseUnits(amount, from.decimals), [amount, from.decimals]);
   const debouncedAmountIn = useDebounced(amountIn, 400);
 
+  const debouncedDest = useDebounced(destAddress.trim(), 400);
   const plan = useMemo(() => planSwap(from, to), [from, to]);
-  const quote = useQuote(from, to, debouncedAmountIn, address ?? undefined);
+  // Pass the real Tron destination into the quote so the fee/output reflect the actual recipient
+  // (a fresh Tron address pays a one-time TRC-20 activation cost; a placeholder would under-quote).
+  const quote = useQuote(from, to, debouncedAmountIn, address ?? undefined, tronDest ? debouncedDest : undefined);
 
   const routeDetail = plan.legs.map((l) => l.detail).join("  →  ") || "—";
 
@@ -104,13 +118,21 @@ export function SwapCard() {
   const insufficient = fromBal != null && amountIn > fromBal;
 
   const canStart =
-    isConnected && !!address && plan.kind !== "invalid" && amountIn > 0n && !blockedByConfig && !insufficient && !quote.isError;
+    isConnected && !!address && plan.kind !== "invalid" && amountIn > 0n && !blockedByConfig && !insufficient && !quote.isError && destValid && !tronSource;
 
   function mainAction() {
     if (!isConnected || !address) return open();
     if (flow.status === "idle")
       // swapId ideally comes from the backend; a client-side random id is used as a fallback.
-      return flow.start({ from, to, amountIn, slippageBps, address: address as `0x${string}`, swapId: randomSwapId() });
+      return flow.start({
+        from,
+        to,
+        amountIn,
+        slippageBps,
+        address: address as `0x${string}`,
+        destAddress: tronDest ? destAddress.trim() : undefined,
+        swapId: randomSwapId(),
+      });
     if (flow.status === "error") return flow.retry();
     if (flow.status === "done") {
       flow.reset();
@@ -122,8 +144,11 @@ export function SwapCard() {
     if (!isConnected) return "Connect Wallet";
     if (blockedByConfig) return "RzSwap not configured";
     if (plan.kind === "invalid") return plan.error ?? "Invalid pair";
+    if (tronSource) return "Buying from Tron — coming soon";
     if (amountIn === 0n) return "Enter an amount";
     if (insufficient) return `Insufficient ${from.symbol}`;
+    if (tronDest && !destValid) return "Enter a Tron address";
+    if (quote.isError && isAmountTooSmallError(quote.error)) return "Amount too small";
     if (flow.status === "running") return "Swapping…";
     if (flow.status === "done") return "Swap complete ✓ — start new";
     if (flow.status === "error") return "Retry";
@@ -205,6 +230,29 @@ export function SwapCard() {
         </div>
       </div>
 
+      {/* TRON DESTINATION (sell → Tron) */}
+      {tronDest && (
+        <div className="mt-3 rounded-2xl bg-bg/50 p-4">
+          <div className="mb-2 text-xs text-muted">Tron destination address</div>
+          <input
+            spellCheck={false}
+            placeholder="T…"
+            value={destAddress}
+            onChange={(e) => {
+              flow.reset();
+              setDestAddress(e.target.value.trim());
+            }}
+            className="w-full min-w-0 bg-transparent font-mono text-sm placeholder:text-muted"
+          />
+          {destAddress.length > 0 && !destValid && (
+            <div className="mt-1 text-xs text-red-400">Not a valid Tron address.</div>
+          )}
+          <div className="mt-1 text-[11px] text-muted">
+            {to.symbol} is delivered to this Tron address (e.g. your exchange deposit address).
+          </div>
+        </div>
+      )}
+
       {/* DETAILS */}
       {amountIn > 0n && (
         <div className="mt-3 space-y-2 rounded-xl border border-border/60 px-3 py-2.5 text-xs text-muted">
@@ -218,6 +266,12 @@ export function SwapCard() {
               <span className="text-white/70">
                 {formatAmount(minReceived, to.decimals)} {to.symbol}
               </span>
+            </div>
+          )}
+          {quote.data?.bridgeFeeUsd != null && quote.data.bridgeFeeUsd > 0 && (
+            <div className="flex items-center justify-between">
+              <span>Bridge fee</span>
+              <span className="text-white/70">≈ {formatUsd(quote.data.bridgeFeeUsd)}</span>
             </div>
           )}
           <div className="flex items-center justify-between">
@@ -239,7 +293,7 @@ export function SwapCard() {
 
       {quote.isError && (
         <div className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-400">
-          {(quote.error as Error)?.message ?? "Could not fetch a quote."}
+          {friendlyRelayError(quote.error)}
         </div>
       )}
 
@@ -265,7 +319,7 @@ export function SwapCard() {
       <TokenSelectModal
         open={picker !== null}
         title={picker === "from" ? "Swap from" : "Swap to"}
-        tokens={ALL_TOKENS}
+        tokens={picker === "from" ? fromTokens : ALL_TOKENS}
         selectedKey={picker === "from" ? tokenKey(from) : tokenKey(to)}
         address={address ?? undefined}
         onSelect={picker === "from" ? selectFrom : selectTo}

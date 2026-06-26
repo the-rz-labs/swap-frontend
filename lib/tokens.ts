@@ -2,9 +2,13 @@ import type { Address } from "viem";
 
 export const BSC_CHAIN_ID = 56;
 export const ETH_CHAIN_ID = 1;
+/** Relay's chain id for Tron (vmType "tvm"). Tron is a Relay endpoint only — no contract there. */
+export const TRON_CHAIN_ID = 728126428;
 
 /** Relay (and most aggregators) represent a chain's native currency with the zero address. */
 export const NATIVE_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
+/** Relay's marker address for native TRX on Tron (the Tron "zero" account, base58). */
+export const TRX_NATIVE_ADDRESS = "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb";
 
 /** Wrapped BNB — the dominant PancakeSwap base pair; used as a routing intermediary. */
 export const WBNB_ADDRESS: Address = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
@@ -16,14 +20,22 @@ export type ChainMeta = { id: number; name: string; shortName: string; logoURI: 
 export const CHAINS: Record<number, ChainMeta> = {
   [BSC_CHAIN_ID]: { id: BSC_CHAIN_ID, name: "BNB Chain", shortName: "BSC", logoURI: `${TW}/smartchain/info/logo.png` },
   [ETH_CHAIN_ID]: { id: ETH_CHAIN_ID, name: "Ethereum", shortName: "Ethereum", logoURI: `${TW}/ethereum/info/logo.png` },
+  [TRON_CHAIN_ID]: { id: TRON_CHAIN_ID, name: "Tron", shortName: "Tron", logoURI: `${TW}/tron/info/logo.png` },
 };
+
+/** VM family of a token's chain. Tron ("tvm") addresses are base58, not 0x-hex. */
+export type TokenVm = "evm" | "tvm";
 
 export type Token = {
   symbol: string;
   name: string;
-  address: Address;
+  /** EVM: 0x 20-byte hex. Tron: base58 (`T…`). Tron tokens are only ever the Relay remote leg and
+   *  never reach a viem/EVM call (those paths are guarded by isBscToken), so `string` is safe. */
+  address: string;
   decimals: number;
   chainId: number;
+  /** Defaults to "evm" when absent. */
+  vm?: TokenVm;
   /** Logo URL; falls back to a generated avatar when absent or it 404s. */
   logoURI?: string;
   /** Marks the BSC token used as the bridge intermediary between Relay and RzSwap. */
@@ -58,6 +70,11 @@ export const BSC_TOKENS: Token[] = [
 
 export const USDT_BSC: Token = BSC_TOKENS.find((t) => t.isHubIntermediary)!;
 
+/** USDT (TRC-20) on Tron. Also used as a FUNDED representative recipient for pre-address fee estimates
+ *  (the Tron delivery fee depends on the recipient; the native zero-address marker quotes anomalously
+ *  cheap, so we estimate against a real funded address instead). */
+export const USDT_TRON_ADDRESS = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+
 /** Cross-chain tokens on Ethereum, routed through Relay. */
 export const REMOTE_TOKENS: Token[] = [
   { symbol: "ETH", name: "Ethereum", address: NATIVE_ADDRESS, decimals: 18, chainId: ETH_CHAIN_ID, logoURI: `${TW}/ethereum/info/logo.png` },
@@ -65,19 +82,38 @@ export const REMOTE_TOKENS: Token[] = [
   { symbol: "USDC", name: "USD Coin", address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6, chainId: ETH_CHAIN_ID, logoURI: `${TW}/ethereum/assets/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/logo.png` },
 ];
 
-export const ALL_TOKENS: Token[] = [...BSC_TOKENS, ...REMOTE_TOKENS];
+/**
+ * Tron tokens routed through Relay (6 decimals, base58 addresses). No contract on Tron.
+ * Only USDT (TRC-20) is offered: Relay's Tron support is USDT-only — there is no swap route to native
+ * TRX as a destination (USDT->TRX returns NO_SWAP_ROUTES_FOUND), so TRX is intentionally omitted.
+ */
+export const TRON_TOKENS: Token[] = [
+  { symbol: "USDT", name: "Tether USD", address: USDT_TRON_ADDRESS, decimals: 6, chainId: TRON_CHAIN_ID, vm: "tvm", logoURI: `${TW}/tron/assets/${USDT_TRON_ADDRESS}/logo.png` },
+];
+
+export const ALL_TOKENS: Token[] = [...BSC_TOKENS, ...REMOTE_TOKENS, ...TRON_TOKENS];
 
 export const CHAIN_NAMES: Record<number, string> = {
   [BSC_CHAIN_ID]: "BNB Chain",
   [ETH_CHAIN_ID]: "Ethereum",
+  [TRON_CHAIN_ID]: "Tron",
 };
+
+export function vmOf(t: Token): TokenVm {
+  return t.vm ?? "evm";
+}
 
 export function isBscToken(t: Token): boolean {
   return t.chainId === BSC_CHAIN_ID;
 }
 
+export function isTronToken(t: Token): boolean {
+  return t.chainId === TRON_CHAIN_ID;
+}
+
 export function isNative(t: Token): boolean {
-  return t.address.toLowerCase() === NATIVE_ADDRESS.toLowerCase();
+  const a = t.address.toLowerCase();
+  return a === NATIVE_ADDRESS.toLowerCase() || a === TRX_NATIVE_ADDRESS.toLowerCase();
 }
 
 export function tokenKey(t: Token): string {

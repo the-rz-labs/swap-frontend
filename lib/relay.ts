@@ -7,8 +7,61 @@ import {
   execute as sdkExecute,
 } from "@reservoir0x/relay-sdk";
 import { bsc, mainnet, arbitrum, base, optimism, polygon } from "viem/chains";
-import type { WalletClient } from "viem";
+import { decodeFunctionData, encodeFunctionData, type WalletClient, type Hex } from "viem";
 import type { Execute, ProgressData } from "@reservoir0x/relay-sdk";
+
+// RelayDepository deposit overloads. Relay's /quote returns the FIXED-amount form; we rewrite it to
+// the amount-less form so the adapter deposits its FULL balance (the entire swap output) — bridging
+// everything instead of a pre-quoted minimum and refunding the slippage drift to the user.
+const DEPOSIT_ERC20_FIXED = [
+  {
+    type: "function",
+    name: "depositErc20",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "depositor", type: "address" },
+      { name: "token", type: "address" },
+      { name: "amount", type: "uint256" },
+      { name: "id", type: "bytes32" },
+    ],
+    outputs: [],
+  },
+] as const;
+const DEPOSIT_ERC20_FULL = [
+  {
+    type: "function",
+    name: "depositErc20",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "depositor", type: "address" },
+      { name: "token", type: "address" },
+      { name: "id", type: "bytes32" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+/**
+ * Rewrite Relay's fixed-amount depositErc20(depositor, token, amount, id) into the amount-less
+ * depositErc20(depositor, token, id), which deposits the caller's FULL approval. The adapter approves
+ * the depository for the entire swap output, so this forwards 100% of the output to Relay with no
+ * drift refund. The `id` is the order id (does not encode the amount). If Relay ever returns a
+ * different deposit shape, we leave the calldata untouched (safe fallback to the quoted behavior).
+ */
+function toFullBalanceDeposit(calldata: Hex): Hex {
+  try {
+    const { functionName, args } = decodeFunctionData({ abi: DEPOSIT_ERC20_FIXED, data: calldata });
+    if (functionName !== "depositErc20") return calldata;
+    const [depositor, token, , id] = args as [string, string, bigint, Hex];
+    return encodeFunctionData({
+      abi: DEPOSIT_ERC20_FULL,
+      functionName: "depositErc20",
+      args: [depositor as `0x${string}`, token as `0x${string}`, id],
+    });
+  } catch {
+    return calldata; // not the expected shape — keep Relay's calldata as-is
+  }
+}
 
 let initialized = false;
 
@@ -93,10 +146,28 @@ export function relayUsd(quote: Execute): { inUsd?: number; outUsd?: number } {
 }
 
 /**
+ * Total bridge fee in USD for a Relay quote — what the user loses moving the asset across chains,
+ * i.e. input USD minus output USD. For a same-asset bridge (USDT→USDT) this is the pure network/
+ * relayer fee (dominated, for Tron, by a ~$0.15 fixed cost to deliver USDT). Returns undefined when
+ * the quote lacks USD pricing.
+ */
+export function relayFeeUsd(quote: Execute): number | undefined {
+  const { inUsd, outUsd } = relayUsd(quote);
+  if (inUsd == null || outUsd == null) return undefined;
+  return Math.max(0, inUsd - outUsd);
+}
+
+/**
  * SELL helper: quotes a USDT-out bridge whose ON-CHAIN depositor is `depositor` (our
- * RelayDepositAdapter), and returns the depository call to execute plus the guaranteed minimum
- * output. The adapter runs this calldata after the RzSwap swap, so the sell is one approve + one
- * call. Uses the raw API (not the SDK) so we can set `user` to a contract.
+ * RelayDepositAdapter), and returns the depository call to execute. The adapter runs this calldata
+ * after the RzSwap swap, so the sell is one approve + one call. Uses the raw API (not the SDK) so we
+ * can set `user` to a contract.
+ *
+ * The returned calldata is rewritten to the amount-less depositErc20 so the adapter deposits its FULL
+ * balance (the entire swap output) — the whole output is bridged to Relay, with no drift refunded to
+ * the user. `amount` is still sent to /quote so Relay can price the destination output; the on-chain
+ * deposit amount is the adapter's actual balance, which the Relay allocator credits via the deposit
+ * event. (`amount` = the swap's expected output so the destination estimate matches what's bridged.)
  */
 export type RelaySellDeposit = { depository: `0x${string}`; data: `0x${string}`; value: string };
 
@@ -104,7 +175,7 @@ export async function getRelaySellDeposit(input: {
   depositor: string;
   recipient: string;
   originCurrency: string; // USDT on BSC
-  amount: string; // base units the adapter will deposit (use the swap's guaranteed minimum)
+  amount: string; // base units used for the destination quote (swap's guaranteed minimum)
   toChainId: number;
   toCurrency: string;
 }): Promise<RelaySellDeposit> {
@@ -127,7 +198,7 @@ export async function getRelaySellDeposit(input: {
   const dep = (j.steps ?? []).find((s: { id?: string }) => s.id === "deposit");
   const item = dep?.items?.[0]?.data;
   if (!item?.to || !item?.data) throw new Error("Relay returned no deposit step for the sell.");
-  return { depository: item.to, data: item.data, value: item.value ?? "0" };
+  return { depository: item.to, data: toFullBalanceDeposit(item.data as Hex), value: item.value ?? "0" };
 }
 
 /** True once every step of an executed quote is complete. */

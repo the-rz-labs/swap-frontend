@@ -19,6 +19,28 @@ export function isBenignRelaySolverError(reason: unknown): boolean {
   return false;
 }
 
+/** True when Relay rejects a swap because the output can't cover the fixed bridge/network fee. */
+export function isAmountTooSmallError(input: unknown): boolean {
+  const m = input instanceof Error ? input.message : String(input ?? "");
+  return /too small to cover fees|amount is too small|insufficient.*to cover/i.test(m);
+}
+
+/**
+ * Maps a raw Relay/quote error into a short, user-facing message. The most common one for small
+ * cross-chain sells is the fee floor (the bridge has a near-fixed network fee — ~$0.18 to Tron), so
+ * we explain it and suggest a larger amount instead of surfacing Relay's cryptic text.
+ */
+export function friendlyRelayError(input: unknown): string {
+  const raw = (input instanceof Error ? input.message : String(input ?? "")).replace(/^Relay sell quote failed:\s*/i, "");
+  if (isAmountTooSmallError(raw)) {
+    return "Amount too small to cover the Tron network fee. Delivering USDT on Tron costs ~$1 (and ~$1.6 to an address that has never held USDT — a one-time activation). Sell a larger amount — about $2 or more.";
+  }
+  if (/no quotes|no routes|unsupported/i.test(raw)) {
+    return "No bridge route available for this pair right now. Try a different amount or token.";
+  }
+  return raw || "Could not fetch a quote.";
+}
+
 let installed = false;
 
 /**

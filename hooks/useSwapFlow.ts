@@ -10,18 +10,18 @@ import {
   getWalletClient,
 } from "@wagmi/core";
 import { wagmiConfig } from "@/lib/wagmi";
-import { BSC_CHAIN_ID, USDT_BSC, type Token } from "@/lib/tokens";
+import { BSC_CHAIN_ID, USDT_BSC, isTronToken, type Token } from "@/lib/tokens";
+import { isTronAddress, tronBase58ToHex } from "@/lib/tron/tronAddress";
 import { ERC20_ABI } from "@/lib/rzswap";
 import { resolveBestBscPath } from "@/lib/route";
 import { getRelayQuote, executeRelay, relayOutputAmount, relayMinimumOutput, getRelaySellDeposit } from "@/lib/relay";
-import { isBenignRelaySolverError } from "@/lib/relayErrors";
+import { isBenignRelaySolverError, friendlyRelayError } from "@/lib/relayErrors";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
 import {
   buildBuyTxs,
   buildSellExtraData,
   RZ_GATEWAY,
   RZ_GATEWAY_ABI,
-  RELAY_ROUTER,
   RELAY_DEPOSIT_ADAPTER,
   GATEWAY_CONFIGURED,
 } from "@/lib/gateway";
@@ -46,6 +46,9 @@ export type SwapContext = {
   amountIn: bigint;
   slippageBps: number;
   address: Address;
+  /** Destination address on a non-EVM target chain (e.g. a base58 Tron address) for sell-out. When
+   *  the `to` token is non-EVM this is required; for EVM targets the connected `address` is used. */
+  destAddress?: string;
   /** Correlation id passed to RzSwap.swap and emitted in the Swapped event (for backend matching). */
   swapId: `0x${string}`;
 };
@@ -60,9 +63,11 @@ async function ensureChain(chainId: number) {
 }
 
 /** Approves `spender` for `amount` of `token` on `chainId` if the current allowance is short. */
-async function ensureAllowance(token: Address, owner: Address, spender: Address, amount: bigint, chainId: number) {
+// `token` is a BSC (EVM) ERC20 address; callers pass Token.address (typed string for Tron support).
+async function ensureAllowance(token: string, owner: Address, spender: Address, amount: bigint, chainId: number) {
+  const address = token as `0x${string}`;
   const current = (await readContract(wagmiConfig, {
-    address: token,
+    address,
     abi: ERC20_ABI,
     functionName: "allowance",
     args: [owner, spender],
@@ -70,7 +75,7 @@ async function ensureAllowance(token: Address, owner: Address, spender: Address,
   })) as bigint;
   if (current >= amount) return;
   const hash = await writeContract(wagmiConfig, {
-    address: token,
+    address,
     abi: ERC20_ABI,
     functionName: "approve",
     args: [spender, amount],
@@ -79,9 +84,9 @@ async function ensureAllowance(token: Address, owner: Address, spender: Address,
   await waitForTransactionReceipt(wagmiConfig, { hash, chainId });
 }
 
-async function bscTokenBalance(token: Address, owner: Address): Promise<bigint> {
+async function bscTokenBalance(token: string, owner: Address): Promise<bigint> {
   return (await readContract(wagmiConfig, {
-    address: token,
+    address: token as `0x${string}`,
     abi: ERC20_ABI,
     functionName: "balanceOf",
     args: [owner],
@@ -140,7 +145,7 @@ export function useSwapFlow() {
           address: RZ_GATEWAY,
           abi: RZ_GATEWAY_ABI,
           functionName: "swapLocal",
-          args: [ctx.swapId, tokenIn.address, tokenOut.address, amountIn, minOut, path, ctx.address],
+          args: [ctx.swapId, tokenIn.address as `0x${string}`, tokenOut.address as `0x${string}`, amountIn, minOut, path, ctx.address],
           chainId: BSC_CHAIN_ID,
         });
         await waitForTransactionReceipt(wagmiConfig, { hash, chainId: BSC_CHAIN_ID });
@@ -153,9 +158,9 @@ export function useSwapFlow() {
     (
       ctx: SwapContext,
       fromChainId: number,
-      fromCurrency: Address,
+      fromCurrency: string,
       toChainId: number,
-      toCurrency: Address,
+      toCurrency: string,
       useIntermediate: boolean,
       measureBscUsdt: boolean,
       legIndex: number,
@@ -228,7 +233,7 @@ export function useSwapFlow() {
           toChainId: BSC_CHAIN_ID,
           toCurrency: USDT_BSC.address,
           amount: ctx.amountIn.toString(),
-          recipient: RELAY_ROUTER,
+          recipient: ctx.address,
           wallet,
         });
         const minUsdt = relayMinimumOutput(estimate) ?? relayOutputAmount(estimate);
@@ -240,14 +245,20 @@ export function useSwapFlow() {
 
         // 3. Quote bridge → USDT WITH the router cleanupErc20sViaCall destination call (approves the
         //    gateway for the full delivered USDT and calls fulfillBuy), then execute.
-        const buyTxs = buildBuyTxs({ swapId: ctx.swapId, tokenOut: ctx.to.address, minOut, path, user: ctx.address });
+        //    `recipient` MUST be the user, NOT the Relay router: Relay maps `recipient` onto the
+        //    router's `nftRecipient`, and RelayRouterV3.multicall reverts `InvalidRecipient` if that
+        //    equals the router itself — which reverts the whole fill (before fulfillBuy runs) and
+        //    refunds the source. The bridged USDT lands in the router via permit2 regardless of
+        //    `recipient`; the destination call (buyTxs.to = router) consumes it. See test/BuyReplayFull
+        //    (reproduces the revert) and test/BuyRecipientFix (proves recipient=user resolves).
+        const buyTxs = buildBuyTxs({ swapId: ctx.swapId, tokenOut: ctx.to.address as `0x${string}`, minOut, path, user: ctx.address });
         const quote = await getRelayQuote({
           fromChainId: ctx.from.chainId,
           fromCurrency: ctx.from.address,
           toChainId: BSC_CHAIN_ID,
           toCurrency: USDT_BSC.address,
           amount: ctx.amountIn.toString(),
-          recipient: RELAY_ROUTER,
+          recipient: ctx.address,
           txs: buyTxs,
           refundOnOrigin: true,
           wallet,
@@ -271,11 +282,12 @@ export function useSwapFlow() {
   );
 
   /**
-   * SELL leg (outbound, 1 approve + 1 call): SellHandler swaps the user's token → USDT via RzSwap,
-   * then RelayDepositAdapter executes Relay's deposit calldata to bridge it out. We quote Relay for
-   * the swap's GUARANTEED MINIMUM USDT so the on-chain deposit can never under-fund (fail-safe: if the
-   * swap somehow under-delivers, the whole call reverts and the user keeps their token); any surplus
-   * is refunded to the user as USDT.
+   * SELL leg (outbound, 1 approve + 1 call): the gateway swaps the user's token → USDT via RzSwap,
+   * then RelayDepositAdapter deposits it into Relay to bridge out. The deposit uses Relay's amount-less
+   * depositErc20 (see getRelaySellDeposit), so the adapter deposits its FULL balance — the entire swap
+   * output is bridged, with NO drift refunded to the user. We still quote Relay with the swap's
+   * guaranteed minimum so the destination estimate never over-promises; the swap's `minStableOut`
+   * floor keeps the sell fail-safe (under-delivery reverts and the user keeps their token).
    */
   const makeSellLeg = useCallback(
     (ctx: SwapContext, legIndex: number): LegRunner =>
@@ -285,7 +297,19 @@ export function useSwapFlow() {
         }
         await ensureChain(BSC_CHAIN_ID);
 
-        // 1. Quote token → USDT via the treasury; the bridge deposits the guaranteed minimum.
+        // Destination recipient: for a non-EVM target (Tron) the user supplies a base58 address; for
+        // EVM targets the connected wallet is the recipient. `refundTo` stays the EVM user (refunds
+        // happen on BSC). The gateway's `recipient` bytes are informational (emitted only).
+        const tronDest = isTronToken(ctx.to);
+        if (tronDest && (!ctx.destAddress || !isTronAddress(ctx.destAddress))) {
+          throw new Error("Enter a valid Tron (T…) destination address.");
+        }
+        const relayRecipient = tronDest ? ctx.destAddress! : ctx.address;
+        const recipientBytes = tronDest
+          ? (tronBase58ToHex(ctx.destAddress!) as `0x${string}`)
+          : encodePacked(["address"], [ctx.address]);
+
+        // 1. Quote token → USDT via the treasury.
         const { path, amountOut: expectedUsdt } = await resolveBestBscPath(
           ctx.amountIn,
           ctx.from.address,
@@ -294,12 +318,15 @@ export function useSwapFlow() {
         const minUsdt = applySlippage(expectedUsdt, ctx.slippageBps);
         if (minUsdt <= 0n) throw new Error("Swap quote returned zero — try a larger amount.");
 
-        // 2. Relay deposit quote with our adapter as the on-chain depositor.
+        // 2. Relay deposit quote with our adapter as the on-chain depositor. Quote at the EXPECTED
+        //    output so the destination estimate matches what's actually bridged (the adapter deposits
+        //    its full balance via the amount-less depositErc20, ~= expectedUsdt). The on-chain swap is
+        //    still floored at minUsdt, so it fail-safe reverts rather than under-delivering.
         const dep = await getRelaySellDeposit({
           depositor: RELAY_DEPOSIT_ADAPTER,
-          recipient: ctx.address,
+          recipient: relayRecipient,
           originCurrency: USDT_BSC.address,
-          amount: minUsdt.toString(),
+          amount: expectedUsdt.toString(),
           toChainId: ctx.to.chainId,
           toCurrency: ctx.to.address,
         });
@@ -313,13 +340,13 @@ export function useSwapFlow() {
           functionName: "sell",
           args: [
             ctx.swapId,
-            ctx.from.address,
+            ctx.from.address as `0x${string}`,
             ctx.amountIn,
             minUsdt,
             path,
             RELAY_DEPOSIT_ADAPTER,
             BigInt(ctx.to.chainId),
-            encodePacked(["address"], [ctx.address]),
+            recipientBytes,
             extraData,
           ],
           value: BigInt(dep.value || "0"),
@@ -384,7 +411,7 @@ export function useSwapFlow() {
           await runnersRef.current[i]();
           patchLeg(i, { status: "done" });
         } catch (e: unknown) {
-          const message = e instanceof Error ? e.message : "Transaction failed";
+          const message = e instanceof Error ? friendlyRelayError(e) : "Transaction failed";
           patchLeg(i, { status: "error", error: message });
           setStatus("error");
           return;

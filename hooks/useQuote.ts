@@ -1,9 +1,10 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { BSC_CHAIN_ID, USDT_BSC, tokenKey, type Token } from "@/lib/tokens";
+import { BSC_CHAIN_ID, USDT_BSC, USDT_TRON_ADDRESS, isTronToken, tokenKey, type Token } from "@/lib/tokens";
+import { isTronAddress } from "@/lib/tron/tronAddress";
 import { resolveBestBscPath, bscUsdValue } from "@/lib/route";
-import { getRelayQuote, relayOutputAmount, relayUsd } from "@/lib/relay";
+import { getRelayQuote, relayOutputAmount, relayUsd, relayFeeUsd } from "@/lib/relay";
 import { classify } from "@/lib/swapPlan";
 
 export type QuoteResult = {
@@ -14,6 +15,8 @@ export type QuoteResult = {
   /** Best-effort USD value of the input / output. */
   inputUsd?: number;
   outputUsd?: number;
+  /** Cross-chain bridge fee in USD (Relay), when the route crosses chains. */
+  bridgeFeeUsd?: number;
 };
 
 async function computeQuote(
@@ -21,8 +24,14 @@ async function computeQuote(
   to: Token,
   amountIn: bigint,
   recipient: string | undefined,
+  destAddress: string | undefined,
 ): Promise<QuoteResult> {
   const kind = classify(from, to);
+  // For a non-EVM (Tron) destination, quote with the user's ACTUAL address when it's valid — the Tron
+  // delivery fee depends on the recipient (a fresh address pays a one-time TRC-20 activation cost), so
+  // a placeholder would under-report the fee. Fall back to a placeholder for the pre-address estimate.
+  const tronRecipient =
+    destAddress && isTronAddress(destAddress) ? destAddress : USDT_TRON_ADDRESS;
 
   if (kind === "local") {
     const { amountOut } = await resolveBestBscPath(amountIn, from.address, to.address);
@@ -37,18 +46,21 @@ async function computeQuote(
     const hubAmount = hubIsEndpoint
       ? amountIn
       : (await resolveBestBscPath(amountIn, from.address, USDT_BSC.address)).amountOut;
+    // The estimate has no wallet, so the SDK uses the origin chain's dead address for `user`; we only
+    // need a recipient that's VALID on the destination chain. Relay rejects an EVM address for a Tron
+    // destination, so use a Tron placeholder there (the real Tron address is supplied at execution).
     const quote = await getRelayQuote({
       fromChainId: BSC_CHAIN_ID,
       fromCurrency: USDT_BSC.address,
       toChainId: to.chainId,
       toCurrency: to.address,
       amount: hubAmount.toString(),
-      recipient,
+      recipient: isTronToken(to) ? tronRecipient : recipient,
     });
     const output = relayOutputAmount(quote);
     if (output == null) throw new Error("Relay returned no output amount.");
     const { inUsd, outUsd } = relayUsd(quote);
-    return { output, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
+    return { output, hubAmount, inputUsd: inUsd, outputUsd: outUsd, bridgeFeeUsd: relayFeeUsd(quote) };
   }
 
   // inbound
@@ -66,18 +78,24 @@ async function computeQuote(
   const { inUsd, outUsd } = relayUsd(quote);
 
   // Plain bridge to USDT — the user receives ~expected, no on-arrival swap.
-  if (hubIsEndpoint) return { output: hubAmount, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
+  if (hubIsEndpoint) return { output: hubAmount, hubAmount, inputUsd: inUsd, outputUsd: outUsd, bridgeFeeUsd: relayFeeUsd(quote) };
 
   // Buy: the fill swaps the bridged USDT into the token via RzSwap, so quote the token output from
   // the expected bridged USDT amount.
   const { amountOut } = await resolveBestBscPath(hubAmount, USDT_BSC.address, to.address);
-  return { output: amountOut, hubAmount, inputUsd: inUsd, outputUsd: outUsd };
+  return { output: amountOut, hubAmount, inputUsd: inUsd, outputUsd: outUsd, bridgeFeeUsd: relayFeeUsd(quote) };
 }
 
-export function useQuote(from: Token, to: Token, amountIn: bigint, recipient: string | undefined) {
+export function useQuote(
+  from: Token,
+  to: Token,
+  amountIn: bigint,
+  recipient: string | undefined,
+  destAddress?: string,
+) {
   return useQuery<QuoteResult>({
-    queryKey: ["quote", tokenKey(from), tokenKey(to), amountIn.toString(), recipient ?? "anon"],
-    queryFn: () => computeQuote(from, to, amountIn, recipient),
+    queryKey: ["quote", tokenKey(from), tokenKey(to), amountIn.toString(), recipient ?? "anon", destAddress ?? ""],
+    queryFn: () => computeQuote(from, to, amountIn, recipient, destAddress),
     enabled: amountIn > 0n && tokenKey(from) !== tokenKey(to),
     staleTime: 8_000,
     refetchInterval: 15_000,

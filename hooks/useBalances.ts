@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { multicall, getBalance } from "@wagmi/core";
 import { wagmiConfig } from "@/lib/wagmi";
 import { ERC20_ABI } from "@/lib/rzswap";
-import { isNative, tokenKey, type Token } from "@/lib/tokens";
+import { isNative, tokenKey, vmOf, type Token } from "@/lib/tokens";
 
 /** Fetches balances for a set of tokens (ERC-20 via multicall + native via getBalance), keyed by tokenKey. */
 export function useBalances(tokens: Token[], address?: string) {
@@ -15,7 +15,10 @@ export function useBalances(tokens: Token[], address?: string) {
     queryFn: async () => {
       const out: Record<string, bigint> = {};
       const byChain = new Map<number, Token[]>();
+      // Only EVM tokens can be read via wagmi here (the connected wallet is EVM). Non-EVM tokens
+      // (e.g. Tron) simply report no balance — their balances aren't needed for swap selection.
       for (const t of tokens) {
+        if (vmOf(t) !== "evm") continue;
         const list = byChain.get(t.chainId) ?? [];
         list.push(t);
         byChain.set(t.chainId, list);
@@ -31,7 +34,7 @@ export function useBalances(tokens: Token[], address?: string) {
               chainId,
               allowFailure: true,
               contracts: erc.map((t) => ({
-                address: t.address,
+                address: t.address as `0x${string}`,
                 abi: ERC20_ABI,
                 functionName: "balanceOf" as const,
                 args: [address as `0x${string}`],

@@ -46,7 +46,7 @@ async function quotePath(amountIn: bigint, path: Address[]): Promise<bigint | nu
  * Resolves the best PancakeSwap path between two BSC tokens by quoting each candidate on-chain and
  * keeping the highest output. Throws if no candidate has liquidity.
  */
-export async function resolveBestBscPath(amountIn: bigint, from: Address, to: Address): Promise<ResolvedRoute> {
+export async function resolveBestBscPath(amountIn: bigint, from: string, to: string): Promise<ResolvedRoute> {
   if (!RZSWAP_CONFIGURED) throw new Error("RzSwap address is not configured (NEXT_PUBLIC_RZSWAP_ADDRESS).");
   const f = getAddress(from);
   const t = getAddress(to);
