@@ -9,9 +9,11 @@ import {
   switchChain,
   getWalletClient,
 } from "@wagmi/core";
-import { wagmiConfig } from "@/lib/wagmi";
+import { wagmiConfig, type AppChainId } from "@/lib/wagmi";
 import { BSC_CHAIN_ID, USDT_BSC, isTronToken, type Token } from "@/lib/tokens";
 import { isTronAddress, tronBase58ToHex } from "@/lib/tron/tronAddress";
+import { tronAdaptedWallet } from "@/lib/tron/tronAdaptedWallet";
+import type { RelayWallet } from "@/lib/relay";
 import { ERC20_ABI } from "@/lib/rzswap";
 import { resolveBestBscPath } from "@/lib/route";
 import { getRelayQuote, executeRelay, relayOutputAmount, relayMinimumOutput, getRelaySellDeposit } from "@/lib/relay";
@@ -49,6 +51,9 @@ export type SwapContext = {
   /** Destination address on a non-EVM target chain (e.g. a base58 Tron address) for sell-out. When
    *  the `to` token is non-EVM this is required; for EVM targets the connected `address` is used. */
   destAddress?: string;
+  /** Connected source address on a non-EVM origin (e.g. a base58 Tron address) for buy-in. Required
+   *  when the `from` token is non-EVM; the matching wallet signs the source transaction. */
+  tronAddress?: string;
   /** Correlation id passed to RzSwap.swap and emitted in the Swapped event (for backend matching). */
   swapId: `0x${string}`;
 };
@@ -59,12 +64,12 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Ensures the wallet is on `chainId`, switching if necessary. */
 async function ensureChain(chainId: number) {
-  await switchChain(wagmiConfig, { chainId });
+  await switchChain(wagmiConfig, { chainId: chainId as AppChainId });
 }
 
 /** Approves `spender` for `amount` of `token` on `chainId` if the current allowance is short. */
 // `token` is a BSC (EVM) ERC20 address; callers pass Token.address (typed string for Tron support).
-async function ensureAllowance(token: string, owner: Address, spender: Address, amount: bigint, chainId: number) {
+async function ensureAllowance(token: string, owner: Address, spender: Address, amount: bigint, chainId: AppChainId) {
   const address = token as `0x${string}`;
   const current = (await readContract(wagmiConfig, {
     address,
@@ -82,6 +87,19 @@ async function ensureAllowance(token: string, owner: Address, spender: Address, 
     chainId,
   });
   await waitForTransactionReceipt(wagmiConfig, { hash, chainId });
+}
+
+/**
+ * The signer for the source leg: a Tron WalletConnect AdaptedWallet when paying from Tron, otherwise
+ * the connected EVM wallet (after switching it to the source chain).
+ */
+async function sourceWallet(ctx: SwapContext): Promise<RelayWallet> {
+  if (isTronToken(ctx.from)) {
+    if (!ctx.tronAddress) throw new Error("Connect your Tron wallet to pay from Tron.");
+    return tronAdaptedWallet(ctx.tronAddress);
+  }
+  await ensureChain(ctx.from.chainId);
+  return (await getWalletClient(wagmiConfig, { chainId: ctx.from.chainId as AppChainId })) as WalletClient;
 }
 
 async function bscTokenBalance(token: string, owner: Address): Promise<bigint> {
@@ -166,8 +184,7 @@ export function useSwapFlow() {
       legIndex: number,
     ): LegRunner =>
       async () => {
-        await ensureChain(fromChainId);
-        const wallet = (await getWalletClient(wagmiConfig, { chainId: fromChainId })) as WalletClient;
+        const wallet = await sourceWallet(ctx);
         const amount = useIntermediate ? ctxRef.current.intermediate : ctx.amountIn;
         if (amount <= 0n) throw new Error("No input amount available for the bridge.");
 
@@ -222,8 +239,7 @@ export function useSwapFlow() {
         if (!GATEWAY_CONFIGURED) {
           throw new Error("Cross-chain buy is not configured (set NEXT_PUBLIC_RZ_GATEWAY).");
         }
-        await ensureChain(ctx.from.chainId);
-        const wallet = (await getWalletClient(wagmiConfig, { chainId: ctx.from.chainId })) as WalletClient;
+        const wallet = await sourceWallet(ctx);
 
         // 1. Estimate the USDT delivered on BSC — use the GUARANTEED minimum so the token floor stays
         //    safe even if the bridge delivers a touch less than quoted.

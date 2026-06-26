@@ -13,20 +13,20 @@
     "node": "20.x"
   },
   "dependencies": {
-    "@reown/appkit": "1.6.8",
-    "@reown/appkit-adapter-wagmi": "1.6.8",
-    "@reservoir0x/relay-sdk": "1.8.1",
+    "@dynamic-labs/ethereum": "4.91.1",
+    "@dynamic-labs/sdk-react-core": "4.91.1",
+    "@dynamic-labs/tron": "4.91.1",
+    "@dynamic-labs/wagmi-connector": "4.91.1",
+    "@reservoir0x/relay-sdk": "2.4.0",
     "@tanstack/react-query": "5.62.7",
     "next": "14.2.35",
     "react": "18.3.1",
     "react-dom": "18.3.1",
-    "viem": "2.23.12",
+    "viem": "^2.45.3",
     "wagmi": "2.14.11"
   },
   "overrides": {
-    "@wagmi/core": "2.16.4",
-    "@wagmi/connectors": "5.7.7",
-    "viem": "2.23.12"
+    "viem": "^2.45.3"
   },
   "devDependencies": {
     "@types/node": "20.17.6",

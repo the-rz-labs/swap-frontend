@@ -1,35 +1,19 @@
-import { WagmiAdapter } from "@reown/appkit-adapter-wagmi";
-import { bsc, mainnet } from "@reown/appkit/networks";
-import type { AppKitNetwork } from "@reown/appkit/networks";
-import { http } from "viem";
-
-export const REOWN_PROJECT_ID = process.env.NEXT_PUBLIC_REOWN_PROJECT_ID ?? "";
-
-if (!REOWN_PROJECT_ID || REOWN_PROJECT_ID.startsWith("REPLACE")) {
-  // Surface a clear message during development instead of a cryptic 401/403 from WalletConnect.
-  console.warn(
-    "[rzswap] NEXT_PUBLIC_REOWN_PROJECT_ID is not set to a real id — wallet connection (and chain " +
-      "logos) will fail. Get one at https://dashboard.reown.com. On-chain reads still work via the " +
-      "explicit RPCs below.",
-  );
-}
+import { createConfig, http } from "wagmi";
+import { bsc, mainnet } from "wagmi/chains";
 
 /**
- * BSC is the hub chain (our RzSwap contract lives here); Ethereum is the cross-chain origin/
- * destination reachable through Relay. BSC is first so AppKit defaults to it.
+ * Plain wagmi config driven by Dynamic.xyz (the wallet modal Relay's bridge uses). Dynamic injects the
+ * connectors via <DynamicWagmiConnector>, so we declare none here and disable wagmi's own injected
+ * discovery. EVM reads/writes (getWalletClient, readContract, balances) keep working unchanged.
  */
-export const networks: [AppKitNetwork, ...AppKitNetwork[]] = [bsc, mainnet];
-
 export const BSC_CHAIN_ID = bsc.id; // 56
 
-// Explicit public RPCs for reads (balances, quotes) — independent of the WalletConnect RPC, which
-// requires a valid projectId and rate-limits. Overridable via env.
 const BSC_RPC = process.env.NEXT_PUBLIC_BSC_RPC || "https://bsc-dataseed.bnbchain.org";
 const ETH_RPC = process.env.NEXT_PUBLIC_ETH_RPC || "https://ethereum-rpc.publicnode.com";
 
-export const wagmiAdapter = new WagmiAdapter({
-  networks,
-  projectId: REOWN_PROJECT_ID,
+export const wagmiConfig = createConfig({
+  chains: [bsc, mainnet],
+  multiInjectedProviderDiscovery: false,
   ssr: true,
   transports: {
     [bsc.id]: http(BSC_RPC),
@@ -37,4 +21,6 @@ export const wagmiAdapter = new WagmiAdapter({
   },
 });
 
-export const wagmiConfig = wagmiAdapter.wagmiConfig;
+/** The chain ids wagmi is configured for (BSC, Ethereum). Used to satisfy wagmi's strict chainId typing
+ *  at call sites that carry a generic `number` (always an EVM chain on those paths). */
+export type AppChainId = (typeof wagmiConfig)["chains"][number]["id"];

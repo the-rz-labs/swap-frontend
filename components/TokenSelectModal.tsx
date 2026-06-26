@@ -12,11 +12,12 @@ type Props = {
   tokens: Token[];
   selectedKey: string;
   address?: string;
+  tronAddress?: string;
   onSelect: (t: Token) => void;
   onClose: () => void;
 };
 
-export function TokenSelectModal({ open, title, tokens, selectedKey, address, onSelect, onClose }: Props) {
+export function TokenSelectModal({ open, title, tokens, selectedKey, address, tronAddress, onSelect, onClose }: Props) {
   const [query, setQuery] = useState("");
   const [chainFilter, setChainFilter] = useState<number | "all">("all");
 
@@ -25,7 +26,7 @@ export function TokenSelectModal({ open, title, tokens, selectedKey, address, on
     return ids.map((id) => CHAINS[id]).filter(Boolean);
   }, [tokens]);
 
-  const { data: balances } = useBalances(tokens, address);
+  const { data: balances } = useBalances(tokens, address, tronAddress);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();

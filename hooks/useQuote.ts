@@ -24,14 +24,8 @@ async function computeQuote(
   to: Token,
   amountIn: bigint,
   recipient: string | undefined,
-  destAddress: string | undefined,
 ): Promise<QuoteResult> {
   const kind = classify(from, to);
-  // For a non-EVM (Tron) destination, quote with the user's ACTUAL address when it's valid — the Tron
-  // delivery fee depends on the recipient (a fresh address pays a one-time TRC-20 activation cost), so
-  // a placeholder would under-report the fee. Fall back to a placeholder for the pre-address estimate.
-  const tronRecipient =
-    destAddress && isTronAddress(destAddress) ? destAddress : USDT_TRON_ADDRESS;
 
   if (kind === "local") {
     const { amountOut } = await resolveBestBscPath(amountIn, from.address, to.address);
@@ -39,23 +33,28 @@ async function computeQuote(
     return { output: amountOut, inputUsd, outputUsd };
   }
 
-  if (!recipient) throw new Error("Connect your wallet to quote a cross-chain route.");
+  // Cross-chain estimate: a connected wallet is NOT required. relay-sdk fills the destination chain's
+  // dead address when no recipient is given (the output amount is recipient-independent). For a Tron
+  // destination we still pass a funded placeholder when the real address isn't entered yet, because the
+  // Tron delivery fee depends on the recipient (a fresh TRC-20 account pays a one-time activation cost).
 
   if (kind === "outbound") {
     const hubIsEndpoint = tokenKey(from) === tokenKey(USDT_BSC);
     const hubAmount = hubIsEndpoint
       ? amountIn
       : (await resolveBestBscPath(amountIn, from.address, USDT_BSC.address)).amountOut;
-    // The estimate has no wallet, so the SDK uses the origin chain's dead address for `user`; we only
-    // need a recipient that's VALID on the destination chain. Relay rejects an EVM address for a Tron
-    // destination, so use a Tron placeholder there (the real Tron address is supplied at execution).
+    const quoteRecipient = isTronToken(to)
+      ? recipient && isTronAddress(recipient)
+        ? recipient
+        : USDT_TRON_ADDRESS
+      : recipient;
     const quote = await getRelayQuote({
       fromChainId: BSC_CHAIN_ID,
       fromCurrency: USDT_BSC.address,
       toChainId: to.chainId,
       toCurrency: to.address,
       amount: hubAmount.toString(),
-      recipient: isTronToken(to) ? tronRecipient : recipient,
+      recipient: quoteRecipient,
     });
     const output = relayOutputAmount(quote);
     if (output == null) throw new Error("Relay returned no output amount.");
@@ -65,6 +64,9 @@ async function computeQuote(
 
   // inbound
   const hubIsEndpoint = tokenKey(to) === tokenKey(USDT_BSC);
+  // The SDK can't derive a dead address for Tron origin (it doesn't know the chain), so it would send
+  // an invalid EVM zero address as `user`. Pass a valid Tron source for the estimate; at execution the
+  // connected Tron wallet supplies the real `user`.
   const quote = await getRelayQuote({
     fromChainId: from.chainId,
     fromCurrency: from.address,
@@ -72,6 +74,7 @@ async function computeQuote(
     toCurrency: USDT_BSC.address,
     amount: amountIn.toString(),
     recipient,
+    user: isTronToken(from) ? USDT_TRON_ADDRESS : undefined,
   });
   const hubAmount = relayOutputAmount(quote);
   if (hubAmount == null) throw new Error("Relay returned no output amount.");
@@ -86,16 +89,10 @@ async function computeQuote(
   return { output: amountOut, hubAmount, inputUsd: inUsd, outputUsd: outUsd, bridgeFeeUsd: relayFeeUsd(quote) };
 }
 
-export function useQuote(
-  from: Token,
-  to: Token,
-  amountIn: bigint,
-  recipient: string | undefined,
-  destAddress?: string,
-) {
+export function useQuote(from: Token, to: Token, amountIn: bigint, recipient: string | undefined) {
   return useQuery<QuoteResult>({
-    queryKey: ["quote", tokenKey(from), tokenKey(to), amountIn.toString(), recipient ?? "anon", destAddress ?? ""],
-    queryFn: () => computeQuote(from, to, amountIn, recipient, destAddress),
+    queryKey: ["quote", tokenKey(from), tokenKey(to), amountIn.toString(), recipient ?? "anon"],
+    queryFn: () => computeQuote(from, to, amountIn, recipient),
     enabled: amountIn > 0n && tokenKey(from) !== tokenKey(to),
     staleTime: 8_000,
     refetchInterval: 15_000,

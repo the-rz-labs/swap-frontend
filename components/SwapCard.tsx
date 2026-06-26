@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { formatUnits, parseEther } from "viem";
-import { useAppKit, useAppKitAccount } from "@reown/appkit/react";
-import { ALL_TOKENS, USDT_BSC, isBscToken, isNative, isTronToken, tokenKey, type Token } from "@/lib/tokens";
+import { formatUnits, parseEther, isAddress } from "viem";
+import { useAccount } from "wagmi";
+import { useDynamicContext, useUserWallets } from "@dynamic-labs/sdk-react-core";
+import { ALL_TOKENS, CHAIN_NAMES, USDT_BSC, isBscToken, isNative, isTronToken, tokenKey, type Token } from "@/lib/tokens";
 import { isTronAddress } from "@/lib/tron/tronAddress";
+import { setTronSigner, tronSignerFromWallet } from "@/lib/tron/tronDynamic";
 import { friendlyRelayError, isAmountTooSmallError } from "@/lib/relayErrors";
 import { RZSWAP_CONFIGURED } from "@/lib/rzswap";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
@@ -41,8 +43,32 @@ function TokenButton({ token, onClick }: { token: Token; onClick: () => void }) 
 }
 
 export function SwapCard() {
-  const { open } = useAppKit();
-  const { address, isConnected } = useAppKitAccount();
+  // EVM account comes through wagmi (Dynamic bridges the connected wallet via DynamicWagmiConnector).
+  const { address, isConnected } = useAccount();
+  // Dynamic drives the multichain "Log in or sign up" modal; the Tron wallet (if connected) shows up
+  // in userWallets and is recognised by its base58 address — robust to Dynamic's chain naming.
+  const { setShowAuthFlow } = useDynamicContext();
+  const userWallets = useUserWallets();
+  const tronWallet = useMemo(
+    () => userWallets.find((w) => w.address && isTronAddress(w.address)),
+    [userWallets],
+  );
+  const tronAddr = tronWallet?.address;
+
+  // Publish the connected Tron wallet's signer to the (non-React) Relay execution path.
+  useEffect(() => {
+    let active = true;
+    if (!tronWallet) {
+      setTronSigner(undefined);
+      return;
+    }
+    tronSignerFromWallet(tronWallet).then((s) => {
+      if (active) setTronSigner(s);
+    });
+    return () => {
+      active = false;
+    };
+  }, [tronWallet]);
 
   const [from, setFrom] = useState<Token>(ALL_TOKENS.find((t) => t.symbol === "ETH")!);
   const [to, setTo] = useState<Token>(ALL_TOKENS.find((t) => t.symbol === "CAR" && isBscToken(t))!);
@@ -52,16 +78,12 @@ export function SwapCard() {
   // Destination address on a non-EVM target (Tron). EVM targets use the connected wallet.
   const [destAddress, setDestAddress] = useState("");
 
-  // Phase 1 supports selling TO Tron only; buying FROM Tron (source signing) is Phase 2. Hide Tron in
-  // the "from" picker until then so users can't pick an unsupported source.
-  const fromTokens = useMemo(() => ALL_TOKENS.filter((t) => !isTronToken(t)), []);
   const tronDest = isTronToken(to);
-  const tronSource = isTronToken(from); // buying FROM Tron is Phase 2 (needs a Tron wallet)
-  const destValid = !tronDest || isTronAddress(destAddress.trim());
+  const tronSource = isTronToken(from); // paying FROM Tron — needs a connected Tron wallet
 
   const flow = useSwapFlow();
 
-  const { data: balances } = useBalances(ALL_TOKENS, address ?? undefined);
+  const { data: balances } = useBalances(ALL_TOKENS, address ?? undefined, tronAddr);
 
   // Invariant: exactly one side must be a BNB Chain token.
   function selectFrom(t: Token) {
@@ -87,11 +109,26 @@ export function SwapCard() {
   const amountIn = useMemo(() => safeParseUnits(amount, from.decimals), [amount, from.decimals]);
   const debouncedAmountIn = useDebounced(amountIn, 400);
 
-  const debouncedDest = useDebounced(destAddress.trim(), 400);
   const plan = useMemo(() => planSwap(from, to), [from, to]);
-  // Pass the real Tron destination into the quote so the fee/output reflect the actual recipient
-  // (a fresh Tron address pays a one-time TRC-20 activation cost; a placeholder would under-quote).
-  const quote = useQuote(from, to, debouncedAmountIn, address ?? undefined, tronDest ? debouncedDest : undefined);
+  const isCrossChain = plan.kind === "inbound" || plan.kind === "outbound";
+
+  // Destination recipient: the wallet auto-available on the destination chain (the Tron wallet for a
+  // Tron destination, the EVM wallet otherwise), or a manually pasted address validated for that chain.
+  const connectedDest = tronDest ? tronAddr : isConnected ? address : undefined;
+  const destEntered = destAddress.trim();
+  const destEnteredValid = tronDest ? isTronAddress(destEntered) : isAddress(destEntered);
+  const destRecipient = connectedDest ?? (destEnteredValid ? destEntered : undefined);
+  const showDestField = isCrossChain && !connectedDest; // need a manual address (no dest-chain wallet)
+  const destOk = !isCrossChain || !!destRecipient;
+  // Source wallet readiness: a Tron source needs the Tron wallet; everything else needs an EVM wallet.
+  const sourceReady = tronSource ? !!tronAddr : isConnected && !!address;
+
+  // Debounced recipient for the quote. The cross-chain output is recipient-independent for EVM dests,
+  // but the Tron delivery fee depends on the recipient, so feed it the real address when available.
+  const debouncedDestAddr = useDebounced(destEntered, 400);
+  const debouncedDestValid = tronDest ? isTronAddress(debouncedDestAddr) : isAddress(debouncedDestAddr);
+  const quoteRecipient = connectedDest ?? (debouncedDestValid ? debouncedDestAddr : undefined);
+  const quote = useQuote(from, to, debouncedAmountIn, quoteRecipient);
 
   const routeDetail = plan.legs.map((l) => l.detail).join("  →  ") || "—";
 
@@ -118,10 +155,10 @@ export function SwapCard() {
   const insufficient = fromBal != null && amountIn > fromBal;
 
   const canStart =
-    isConnected && !!address && plan.kind !== "invalid" && amountIn > 0n && !blockedByConfig && !insufficient && !quote.isError && destValid && !tronSource;
+    sourceReady && destOk && plan.kind !== "invalid" && amountIn > 0n && !blockedByConfig && !insufficient && !quote.isError;
 
   function mainAction() {
-    if (!isConnected || !address) return open();
+    if (!sourceReady) return setShowAuthFlow(true);
     if (flow.status === "idle")
       // swapId ideally comes from the backend; a client-side random id is used as a fallback.
       return flow.start({
@@ -129,8 +166,11 @@ export function SwapCard() {
         to,
         amountIn,
         slippageBps,
-        address: address as `0x${string}`,
-        destAddress: tronDest ? destAddress.trim() : undefined,
+        // For a buy (inbound) the recipient is the destination BNB-Chain address; otherwise it's the
+        // connected EVM signer. For a sell to Tron, the Tron destination goes in `destAddress`.
+        address: (plan.kind === "inbound" ? destRecipient : address) as `0x${string}`,
+        destAddress: tronDest && plan.kind === "outbound" ? destRecipient : undefined,
+        tronAddress: tronSource ? tronAddr : undefined,
         swapId: randomSwapId(),
       });
     if (flow.status === "error") return flow.retry();
@@ -141,13 +181,12 @@ export function SwapCard() {
   }
 
   const buttonLabel = (() => {
-    if (!isConnected) return "Connect Wallet";
+    if (!sourceReady) return tronSource ? "Connect Tron wallet" : "Connect Wallet";
     if (blockedByConfig) return "RzSwap not configured";
     if (plan.kind === "invalid") return plan.error ?? "Invalid pair";
-    if (tronSource) return "Buying from Tron — coming soon";
     if (amountIn === 0n) return "Enter an amount";
     if (insufficient) return `Insufficient ${from.symbol}`;
-    if (tronDest && !destValid) return "Enter a Tron address";
+    if (!destOk) return tronDest ? "Enter a Tron address" : "Enter destination address";
     if (quote.isError && isAmountTooSmallError(quote.error)) return "Amount too small";
     if (flow.status === "running") return "Swapping…";
     if (flow.status === "done") return "Swap complete ✓ — start new";
@@ -169,9 +208,7 @@ export function SwapCard() {
           <span>You pay</span>
           {fromBal != null && (
             <span className="flex items-center gap-2">
-              <span>
-                Balance: {formatAmount(fromBal, from.decimals, 4)}
-              </span>
+              <span>Balance: {formatAmount(fromBal, from.decimals, 4)}</span>
               {fromBal > 0n && (
                 <button onClick={setMax} className="font-semibold text-accent hover:text-accentHover">
                   MAX
@@ -230,13 +267,16 @@ export function SwapCard() {
         </div>
       </div>
 
-      {/* TRON DESTINATION (sell → Tron) */}
-      {tronDest && (
+      {/* DESTINATION ADDRESS — shown for a cross-chain route when no wallet is connected on the
+          destination chain (e.g. buying a BNB-Chain token while paying from Tron, or selling to Tron). */}
+      {showDestField && (
         <div className="mt-3 rounded-2xl bg-bg/50 p-4">
-          <div className="mb-2 text-xs text-muted">Tron destination address</div>
+          <div className="mb-2 text-xs text-muted">
+            {tronDest ? "Tron destination address" : `${CHAIN_NAMES[to.chainId] ?? "Destination"} address`}
+          </div>
           <input
             spellCheck={false}
-            placeholder="T…"
+            placeholder={tronDest ? "T…" : "0x…"}
             value={destAddress}
             onChange={(e) => {
               flow.reset();
@@ -244,11 +284,12 @@ export function SwapCard() {
             }}
             className="w-full min-w-0 bg-transparent font-mono text-sm placeholder:text-muted"
           />
-          {destAddress.length > 0 && !destValid && (
-            <div className="mt-1 text-xs text-red-400">Not a valid Tron address.</div>
+          {destEntered.length > 0 && !destEnteredValid && (
+            <div className="mt-1 text-xs text-red-400">Not a valid {tronDest ? "Tron" : "address"}.</div>
           )}
           <div className="mt-1 text-[11px] text-muted">
-            {to.symbol} is delivered to this Tron address (e.g. your exchange deposit address).
+            {to.symbol} is delivered to this {tronDest ? "Tron" : CHAIN_NAMES[to.chainId] ?? "destination"} address
+            {tronDest ? " (e.g. your exchange deposit address)." : "."}
           </div>
         </div>
       )}
@@ -319,9 +360,10 @@ export function SwapCard() {
       <TokenSelectModal
         open={picker !== null}
         title={picker === "from" ? "Swap from" : "Swap to"}
-        tokens={picker === "from" ? fromTokens : ALL_TOKENS}
+        tokens={ALL_TOKENS}
         selectedKey={picker === "from" ? tokenKey(from) : tokenKey(to)}
         address={address ?? undefined}
+        tronAddress={tronAddr}
         onSelect={picker === "from" ? selectFrom : selectTo}
         onClose={() => setPicker(null)}
       />

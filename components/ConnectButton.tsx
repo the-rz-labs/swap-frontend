@@ -1,18 +1,12 @@
 "use client";
 
-import { useAppKit, useAppKitAccount } from "@reown/appkit/react";
-import { shortHash } from "@/lib/format";
+import { DynamicWidget } from "@dynamic-labs/sdk-react-core";
 
+/**
+ * Dynamic's widget in the header: the connect button and, once connected, the account/network UI.
+ * Clicking it opens the wallet-only modal (searchable wallets, Installed/Multichain badges) — the same
+ * experience as relay.link/bridge.
+ */
 export function ConnectButton() {
-  const { open } = useAppKit();
-  const { address, isConnected } = useAppKitAccount();
-
-  return (
-    <button
-      onClick={() => open()}
-      className="rounded-xl2 bg-accent px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-accentHover"
-    >
-      {isConnected && address ? shortHash(address) : "Connect Wallet"}
-    </button>
-  );
+  return <DynamicWidget />;
 }

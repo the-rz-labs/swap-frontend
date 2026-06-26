@@ -8,7 +8,10 @@ import {
 } from "@reservoir0x/relay-sdk";
 import { bsc, mainnet, arbitrum, base, optimism, polygon } from "viem/chains";
 import { decodeFunctionData, encodeFunctionData, type WalletClient, type Hex } from "viem";
-import type { Execute, ProgressData } from "@reservoir0x/relay-sdk";
+import type { Execute, ProgressData, AdaptedWallet, RelayChain } from "@reservoir0x/relay-sdk";
+
+/** A signer Relay can execute with: an EVM viem wallet, or an adapted (e.g. Tron) wallet. */
+export type RelayWallet = WalletClient | AdaptedWallet;
 
 // RelayDepository deposit overloads. Relay's /quote returns the FIXED-amount form; we rewrite it to
 // the amount-less form so the adapter deposits its FULL balance (the entire swap output) — bridging
@@ -65,13 +68,31 @@ function toFullBalanceDeposit(calldata: Hex): Hex {
 
 let initialized = false;
 
+/**
+ * Tron isn't a viem chain, so it must be registered manually. The SDK only needs `id` + `vmType` to
+ * resolve a valid Tron dead address for read-only quotes; without it the SDK falls back to the EVM zero
+ * address and Relay rejects "Invalid address 0x000…0 for chain 728126428".
+ */
+const TRON_RELAY_CHAIN: RelayChain = {
+  id: 728126428,
+  name: "tron",
+  displayName: "Tron",
+  vmType: "tvm",
+  currency: { symbol: "TRX", name: "TRX", address: "T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb", decimals: 6 },
+  depositEnabled: true,
+  tokenSupport: "Limited",
+};
+
 /** Lazily configure the Relay client once (idempotent). */
 export function ensureRelay() {
   if (initialized) return getClient();
   createClient({
     baseApiUrl: MAINNET_RELAY_API,
     source: process.env.NEXT_PUBLIC_RELAY_SOURCE ?? "rzswap.app",
-    chains: [bsc, mainnet, arbitrum, base, optimism, polygon].map(convertViemChainToRelayChain),
+    chains: [
+      ...[bsc, mainnet, arbitrum, base, optimism, polygon].map(convertViemChainToRelayChain),
+      TRON_RELAY_CHAIN,
+    ],
   });
   initialized = true;
   return getClient();
@@ -89,7 +110,10 @@ export type RelayQuoteInput = {
   amount: string;
   /** Destination recipient (defaults to the connected user). */
   recipient?: string;
-  wallet?: WalletClient;
+  /** Source/payer address. Needed for read-only estimates on chains the SDK can't derive a dead
+   *  address for (e.g. Tron); at execution the wallet supplies it. */
+  user?: string;
+  wallet?: RelayWallet;
   /** Destination-chain calls to run as part of the fill (bridge-and-execute). */
   txs?: RelayCallTx[];
   /** Refund on the origin chain if the destination execution can't complete. */
@@ -99,28 +123,37 @@ export type RelayQuoteInput = {
 /** Fetches a Relay EXACT_INPUT quote. Wallet is optional for read-only estimates. */
 export async function getRelayQuote(input: RelayQuoteInput): Promise<Execute> {
   ensureRelay();
-  return sdkGetQuote({
-    chainId: input.fromChainId,
-    currency: input.fromCurrency,
-    toChainId: input.toChainId,
-    toCurrency: input.toCurrency,
-    amount: input.amount,
-    tradeType: "EXACT_INPUT",
-    recipient: input.recipient,
-    wallet: input.wallet,
-    txs: input.txs,
-    options: input.refundOnOrigin != null ? { refundOnOrigin: input.refundOnOrigin } : undefined,
-  });
+  // relay-sdk 2.x no longer auto-fills `user`/`recipient`; passing `includeDefaultParameters = true`
+  // (2nd arg) makes it derive them from the wallet (or the chain's dead address for read-only
+  // estimates), restoring the 1.x behaviour. Without it the SDK throws "User is required".
+  return sdkGetQuote(
+    {
+      chainId: input.fromChainId,
+      currency: input.fromCurrency,
+      toChainId: input.toChainId,
+      toCurrency: input.toCurrency,
+      amount: input.amount,
+      tradeType: "EXACT_INPUT",
+      recipient: input.recipient,
+      user: input.user,
+      wallet: input.wallet,
+      txs: input.txs,
+      options: input.refundOnOrigin != null ? { refundOnOrigin: input.refundOnOrigin } : undefined,
+    },
+    true,
+  );
 }
 
 /** Executes a previously fetched Relay quote, reporting progress to the caller. */
 export async function executeRelay(
   quote: Execute,
-  wallet: WalletClient,
+  wallet: RelayWallet,
   onProgress?: (data: ProgressData) => void,
 ): Promise<Execute> {
   ensureRelay();
-  return sdkExecute({ quote, wallet, onProgress });
+  // relay-sdk 2.x returns { data, abortController }; the rest of the app expects the Execute itself.
+  const { data } = await sdkExecute({ quote, wallet, onProgress });
+  return data;
 }
 
 /** Output amount (base units) a Relay quote will deliver, if present. */
