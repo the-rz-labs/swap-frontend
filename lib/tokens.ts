@@ -75,11 +75,39 @@ export const USDT_BSC: Token = BSC_TOKENS.find((t) => t.isHubIntermediary)!;
  *  cheap, so we estimate against a real funded address instead). */
 export const USDT_TRON_ADDRESS = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 
-/** Cross-chain tokens on Ethereum, routed through Relay. */
+/** WETH — ETH hub path hop for GOLDGR (not held as inventory). */
+export const WETH_ADDRESS: Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+
+/** USDT on Ethereum (6-dec) — ETH treasury stable / Relay dest currency for GOLDGR buys. */
+export const USDT_ETH: Token = {
+  symbol: "USDT",
+  name: "Tether USD",
+  address: "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+  decimals: 6,
+  chainId: ETH_CHAIN_ID,
+  isHubIntermediary: true,
+  logoURI: `${TW}/ethereum/assets/0xdAC17F958D2ee523a2206206994597C13D831ec7/logo.png`,
+};
+
+/** GOLDGR on Ethereum — ETH treasury inventory token (never bridges). */
+export const GOLDGR: Token = {
+  symbol: "GOLDGR",
+  name: "GOLDGR",
+  address: "0x957E0fDfbd1c2F97648318B2f057E327996EC367",
+  decimals: 18,
+  chainId: ETH_CHAIN_ID,
+};
+
+/**
+ * Cross-chain tokens on Ethereum.
+ * USDT appears once (USDT_ETH) — hub for GOLDGR local/buy/sell.
+ * ETH/USDC remain Relay remotes for non-GOLDGR routes and GOLDGR buys via Relay→USDT.
+ */
 export const REMOTE_TOKENS: Token[] = [
   { symbol: "ETH", name: "Ethereum", address: NATIVE_ADDRESS, decimals: 18, chainId: ETH_CHAIN_ID, logoURI: `${TW}/ethereum/info/logo.png` },
-  { symbol: "USDT", name: "Tether USD", address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6, chainId: ETH_CHAIN_ID, logoURI: `${TW}/ethereum/assets/0xdAC17F958D2ee523a2206206994597C13D831ec7/logo.png` },
+  USDT_ETH,
   { symbol: "USDC", name: "USD Coin", address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6, chainId: ETH_CHAIN_ID, logoURI: `${TW}/ethereum/assets/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/logo.png` },
+  GOLDGR,
 ];
 
 /**
@@ -109,6 +137,24 @@ export function isBscToken(t: Token): boolean {
 
 export function isTronToken(t: Token): boolean {
   return t.chainId === TRON_CHAIN_ID;
+}
+
+export function isEthToken(t: Token): boolean {
+  return t.chainId === ETH_CHAIN_ID;
+}
+
+export function isGoldgr(t: Token): boolean {
+  return tokenKey(t) === tokenKey(GOLDGR);
+}
+
+/** True when either side of the pair is GOLDGR — FE GOLDGR hub branch gate. */
+export function involvesGoldgr(from: Token, to: Token): boolean {
+  return isGoldgr(from) || isGoldgr(to);
+}
+
+/** ETH treasury inventory tokens (USDT hub + GOLDGR). */
+export function isEthTreasuryToken(t: Token): boolean {
+  return tokenKey(t) === tokenKey(USDT_ETH) || isGoldgr(t);
 }
 
 export function isNative(t: Token): boolean {
