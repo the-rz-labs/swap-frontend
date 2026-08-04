@@ -10,12 +10,22 @@ import {
   getWalletClient,
 } from "@wagmi/core";
 import { wagmiConfig, type AppChainId } from "@/lib/wagmi";
-import { BSC_CHAIN_ID, USDT_BSC, isTronToken, type Token } from "@/lib/tokens";
+import {
+  BSC_CHAIN_ID,
+  ETH_CHAIN_ID,
+  USDT_BSC,
+  USDT_ETH,
+  GOLDGR,
+  isTronToken,
+  isBscToken,
+  tokenKey,
+  type Token,
+} from "@/lib/tokens";
 import { isTronAddress, tronBase58ToHex } from "@/lib/tron/tronAddress";
 import { tronAdaptedWallet } from "@/lib/tron/tronAdaptedWallet";
 import type { RelayWallet } from "@/lib/relay";
 import { ERC20_ABI } from "@/lib/rzswap";
-import { resolveBestBscPath } from "@/lib/route";
+import { resolveBestBscPath, resolveEthGoldgrPath } from "@/lib/route";
 import { getRelayQuote, executeRelay, relayOutputAmount, relayMinimumOutput, getRelaySellDeposit } from "@/lib/relay";
 import { isBenignRelaySolverError, friendlyRelayError } from "@/lib/relayErrors";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
@@ -27,6 +37,7 @@ import {
   RELAY_DEPOSIT_ADAPTER,
   GATEWAY_CONFIGURED,
 } from "@/lib/gateway";
+import { ETH_HUB, ethHubConfigured, ethSellConfigured } from "@/lib/hub";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
 
@@ -374,6 +385,286 @@ export function useSwapFlow() {
     [patchLeg],
   );
 
+  // ── GOLDGR legs (ETH hub) — only wired when plan.kind is a GOLDGR kind ──
+
+  /** LOCAL ETH: USDT ↔ GOLDGR via ETH RzGateway.swapLocal. */
+  const makeLocalEthLeg = useCallback(
+    (ctx: SwapContext): LegRunner =>
+      async () => {
+        if (!ethHubConfigured()) throw new Error("ETH GOLDGR hub is not configured.");
+        await ensureChain(ETH_CHAIN_ID);
+        const amountIn = ctx.amountIn;
+        if (amountIn <= 0n) throw new Error("No input amount available for the swap.");
+
+        const { path, amountOut: quoted } = await resolveEthGoldgrPath(amountIn, ctx.from, ctx.to);
+        const minOut = applySlippage(quoted, ctx.slippageBps);
+
+        await ensureAllowance(ctx.from.address, ctx.address, ETH_HUB.gateway, amountIn, ETH_CHAIN_ID);
+
+        const hash = await writeContract(wagmiConfig, {
+          address: ETH_HUB.gateway,
+          abi: RZ_GATEWAY_ABI,
+          functionName: "swapLocal",
+          args: [
+            ctx.swapId,
+            ctx.from.address as `0x${string}`,
+            ctx.to.address as `0x${string}`,
+            amountIn,
+            minOut,
+            path,
+            ctx.address,
+          ],
+          chainId: ETH_CHAIN_ID,
+        });
+        await waitForTransactionReceipt(wagmiConfig, { hash, chainId: ETH_CHAIN_ID });
+      },
+    [],
+  );
+
+  /**
+   * BUY GOLDGR: Relay → USDT(ETH) + ETH fulfillBuy. Same approve-then-call model as BSC buys;
+   * destination hub is ETH_HUB.
+   */
+  const makeRelayBuyGoldgrLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        if (!ethHubConfigured()) throw new Error("ETH GOLDGR hub is not configured.");
+        const wallet = await sourceWallet(ctx);
+
+        const estimate = await getRelayQuote({
+          fromChainId: ctx.from.chainId,
+          fromCurrency: ctx.from.address,
+          toChainId: ETH_CHAIN_ID,
+          toCurrency: USDT_ETH.address,
+          amount: ctx.amountIn.toString(),
+          recipient: ctx.address,
+          wallet,
+        });
+        const minUsdt = relayMinimumOutput(estimate) ?? relayOutputAmount(estimate);
+        if (!minUsdt || minUsdt <= 0n) throw new Error("Could not estimate the bridged USDT amount.");
+
+        const { path, amountOut: quotedToken } = await resolveEthGoldgrPath(minUsdt, USDT_ETH, GOLDGR);
+        const minOut = applySlippage(quotedToken, ctx.slippageBps);
+
+        const buyTxs = buildBuyTxs({
+          swapId: ctx.swapId,
+          tokenOut: GOLDGR.address as `0x${string}`,
+          minOut,
+          path,
+          user: ctx.address,
+          gateway: ETH_HUB.gateway,
+          usdt: USDT_ETH.address as `0x${string}`,
+        });
+        const quote = await getRelayQuote({
+          fromChainId: ctx.from.chainId,
+          fromCurrency: ctx.from.address,
+          toChainId: ETH_CHAIN_ID,
+          toCurrency: USDT_ETH.address,
+          amount: ctx.amountIn.toString(),
+          recipient: ctx.address,
+          txs: buyTxs,
+          refundOnOrigin: true,
+          wallet,
+        });
+
+        let sawTxHash = false;
+        try {
+          await executeRelay(quote, wallet, (data) => {
+            const tx = data.txHashes?.[0];
+            if (tx) {
+              sawTxHash = true;
+              patchLeg(legIndex, { txHash: tx.txHash, chainId: tx.chainId });
+            }
+          });
+        } catch (e) {
+          if (!sawTxHash || !isBenignRelaySolverError(e)) throw e;
+          patchLeg(legIndex, { note: "Submitted — Relay is bridging and swapping into GOLDGR on Ethereum." });
+        }
+      },
+    [patchLeg],
+  );
+
+  /**
+   * SELL GOLDGR from ETH: swap GOLDGR→USDT then adapter bridges out.
+   * When destination is a BSC ecosystem token, attach BSC fulfillBuy txs.
+   */
+  const makeSellGoldgrLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        if (!ethSellConfigured()) {
+          throw new Error(
+            "GOLDGR sell is not configured — set NEXT_PUBLIC_ETH_RELAY_DEPOSIT_ADAPTER and NEXT_PUBLIC_ETH_RELAY_DEPOSITORY.",
+          );
+        }
+        await ensureChain(ETH_CHAIN_ID);
+
+        const tronDest = isTronToken(ctx.to);
+        if (tronDest && (!ctx.destAddress || !isTronAddress(ctx.destAddress))) {
+          throw new Error("Enter a valid Tron (T…) destination address.");
+        }
+        const relayRecipient = tronDest ? ctx.destAddress! : ctx.address;
+        const recipientBytes = tronDest
+          ? (tronBase58ToHex(ctx.destAddress!) as `0x${string}`)
+          : encodePacked(["address"], [ctx.address]);
+
+        const { path, amountOut: expectedUsdt } = await resolveEthGoldgrPath(ctx.amountIn, GOLDGR, USDT_ETH);
+        const minUsdt = applySlippage(expectedUsdt, ctx.slippageBps);
+        if (minUsdt <= 0n) throw new Error("Swap quote returned zero — try a larger amount.");
+
+        const destIsBscToken = isBscToken(ctx.to) && tokenKey(ctx.to) !== tokenKey(USDT_BSC);
+        let toChainId = ctx.to.chainId;
+        let toCurrency = ctx.to.address;
+        let txs: ReturnType<typeof buildBuyTxs> | undefined;
+
+        if (destIsBscToken) {
+          // Bridge USDT to BSC, then fulfillBuy into the BSC token.
+          const minUsdtBscEstimate = await getRelayQuote({
+            fromChainId: ETH_CHAIN_ID,
+            fromCurrency: USDT_ETH.address,
+            toChainId: BSC_CHAIN_ID,
+            toCurrency: USDT_BSC.address,
+            amount: expectedUsdt.toString(),
+            recipient: ctx.address,
+          });
+          const minBscUsdt = relayMinimumOutput(minUsdtBscEstimate) ?? relayOutputAmount(minUsdtBscEstimate);
+          if (!minBscUsdt || minBscUsdt <= 0n) throw new Error("Could not estimate bridged BSC USDT.");
+          const { path: bscPath, amountOut: quotedToken } = await resolveBestBscPath(
+            minBscUsdt,
+            USDT_BSC.address,
+            ctx.to.address,
+          );
+          const minOut = applySlippage(quotedToken, ctx.slippageBps);
+          txs = buildBuyTxs({
+            swapId: ctx.swapId,
+            tokenOut: ctx.to.address as `0x${string}`,
+            minOut,
+            path: bscPath,
+            user: ctx.address,
+          });
+          toChainId = BSC_CHAIN_ID;
+          toCurrency = USDT_BSC.address;
+        }
+
+        const dep = await getRelaySellDeposit({
+          depositor: ETH_HUB.adapter,
+          recipient: relayRecipient,
+          originCurrency: USDT_ETH.address,
+          amount: expectedUsdt.toString(),
+          toChainId,
+          toCurrency,
+          originChainId: ETH_CHAIN_ID,
+          txs,
+          refundOnOrigin: txs ? true : undefined,
+        });
+        const extraData = buildSellExtraData(dep.depository, ctx.address, dep.data);
+
+        await ensureAllowance(GOLDGR.address, ctx.address, ETH_HUB.gateway, ctx.amountIn, ETH_CHAIN_ID);
+        const hash = await writeContract(wagmiConfig, {
+          address: ETH_HUB.gateway,
+          abi: RZ_GATEWAY_ABI,
+          functionName: "sell",
+          args: [
+            ctx.swapId,
+            GOLDGR.address as `0x${string}`,
+            ctx.amountIn,
+            minUsdt,
+            path,
+            ETH_HUB.adapter,
+            BigInt(toChainId),
+            recipientBytes,
+            extraData,
+          ],
+          value: BigInt(dep.value || "0"),
+          chainId: ETH_CHAIN_ID,
+        });
+        patchLeg(legIndex, { txHash: hash, chainId: ETH_CHAIN_ID });
+        await waitForTransactionReceipt(wagmiConfig, { hash, chainId: ETH_CHAIN_ID });
+      },
+    [patchLeg],
+  );
+
+  /**
+   * BSC ecosystem → GOLDGR: BSC sell (token→USDT) + Relay → USDT(ETH) + ETH fulfillBuy.
+   * One approve + one BSC `sell` call; no user ETH signature.
+   */
+  const makeBscToGoldgrLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        if (!GATEWAY_CONFIGURED) throw new Error("BSC gateway is not configured.");
+        if (!ethHubConfigured()) throw new Error("ETH GOLDGR hub is not configured.");
+        await ensureChain(BSC_CHAIN_ID);
+
+        const { path, amountOut: expectedUsdt } = await resolveBestBscPath(
+          ctx.amountIn,
+          ctx.from.address,
+          USDT_BSC.address,
+        );
+        const minUsdt = applySlippage(expectedUsdt, ctx.slippageBps);
+        if (minUsdt <= 0n) throw new Error("Swap quote returned zero — try a larger amount.");
+
+        const bridgeEst = await getRelayQuote({
+          fromChainId: BSC_CHAIN_ID,
+          fromCurrency: USDT_BSC.address,
+          toChainId: ETH_CHAIN_ID,
+          toCurrency: USDT_ETH.address,
+          amount: expectedUsdt.toString(),
+          recipient: ctx.address,
+        });
+        const minEthUsdt = relayMinimumOutput(bridgeEst) ?? relayOutputAmount(bridgeEst);
+        if (!minEthUsdt || minEthUsdt <= 0n) throw new Error("Could not estimate bridged ETH USDT.");
+
+        const { path: ethPath, amountOut: quotedGold } = await resolveEthGoldgrPath(minEthUsdt, USDT_ETH, GOLDGR);
+        const minOut = applySlippage(quotedGold, ctx.slippageBps);
+
+        const buyTxs = buildBuyTxs({
+          swapId: ctx.swapId,
+          tokenOut: GOLDGR.address as `0x${string}`,
+          minOut,
+          path: ethPath,
+          user: ctx.address,
+          gateway: ETH_HUB.gateway,
+          usdt: USDT_ETH.address as `0x${string}`,
+        });
+
+        const dep = await getRelaySellDeposit({
+          depositor: RELAY_DEPOSIT_ADAPTER,
+          recipient: ctx.address,
+          originCurrency: USDT_BSC.address,
+          amount: expectedUsdt.toString(),
+          toChainId: ETH_CHAIN_ID,
+          toCurrency: USDT_ETH.address,
+          originChainId: BSC_CHAIN_ID,
+          txs: buyTxs,
+          refundOnOrigin: true,
+        });
+        const extraData = buildSellExtraData(dep.depository, ctx.address, dep.data);
+        const recipientBytes = encodePacked(["address"], [ctx.address]);
+
+        await ensureAllowance(ctx.from.address, ctx.address, RZ_GATEWAY, ctx.amountIn, BSC_CHAIN_ID);
+        const hash = await writeContract(wagmiConfig, {
+          address: RZ_GATEWAY,
+          abi: RZ_GATEWAY_ABI,
+          functionName: "sell",
+          args: [
+            ctx.swapId,
+            ctx.from.address as `0x${string}`,
+            ctx.amountIn,
+            minUsdt,
+            path,
+            RELAY_DEPOSIT_ADAPTER,
+            BigInt(ETH_CHAIN_ID),
+            recipientBytes,
+            extraData,
+          ],
+          value: BigInt(dep.value || "0"),
+          chainId: BSC_CHAIN_ID,
+        });
+        patchLeg(legIndex, { txHash: hash, chainId: BSC_CHAIN_ID });
+        await waitForTransactionReceipt(wagmiConfig, { hash, chainId: BSC_CHAIN_ID });
+      },
+    [patchLeg],
+  );
+
   // ── prepare ─────────────────────────────────────────────────────────────
 
   const prepare = useCallback(
@@ -406,13 +697,54 @@ export function useSwapFlow() {
           legState.push({ key: "buy", label: `Buy ${ctx.to.symbol} (bridge + swap)`, status: "pending", chainId: ctx.from.chainId });
           runners.push(makeRelayBuyLeg(ctx, 0));
         }
+      } else if (plan.kind === "local-eth") {
+        legState.push({
+          key: "local-eth",
+          label: `Swap ${ctx.from.symbol} → ${ctx.to.symbol}`,
+          status: "pending",
+          chainId: ETH_CHAIN_ID,
+        });
+        runners.push(makeLocalEthLeg(ctx));
+      } else if (plan.kind === "buy-goldgr") {
+        legState.push({
+          key: "buy-goldgr",
+          label: `Buy GOLDGR (bridge + swap)`,
+          status: "pending",
+          chainId: ctx.from.chainId,
+        });
+        runners.push(makeRelayBuyGoldgrLeg(ctx, 0));
+      } else if (plan.kind === "sell-goldgr") {
+        legState.push({
+          key: "sell-goldgr",
+          label: `Sell GOLDGR → ${ctx.to.symbol}`,
+          status: "pending",
+          chainId: ETH_CHAIN_ID,
+        });
+        runners.push(makeSellGoldgrLeg(ctx, 0));
+      } else if (plan.kind === "bsc-to-goldgr") {
+        legState.push({
+          key: "bsc-to-goldgr",
+          label: `Sell ${ctx.from.symbol} → GOLDGR`,
+          status: "pending",
+          chainId: BSC_CHAIN_ID,
+        });
+        runners.push(makeBscToGoldgrLeg(ctx, 0));
       }
 
       runnersRef.current = runners;
       setLegs(legState);
       setCurrent(0);
     },
-    [makeLocalLeg, makeRelayLeg, makeRelayBuyLeg, makeSellLeg],
+    [
+      makeLocalLeg,
+      makeRelayLeg,
+      makeRelayBuyLeg,
+      makeSellLeg,
+      makeLocalEthLeg,
+      makeRelayBuyGoldgrLeg,
+      makeSellGoldgrLeg,
+      makeBscToGoldgrLeg,
+    ],
   );
 
   // ── auto-run all legs sequentially (one click; wallet prompts in order) ────
