@@ -2,8 +2,9 @@ import type { Address } from "viem";
 import { getAddress, formatUnits } from "viem";
 import { readContract } from "@wagmi/core";
 import { wagmiConfig } from "./wagmi";
-import { BSC_CHAIN_ID, USDT_BSC, WBNB_ADDRESS, tokenKey, type Token } from "./tokens";
+import { BSC_CHAIN_ID, ETH_CHAIN_ID, USDT_BSC, USDT_ETH, WBNB_ADDRESS, tokenKey, type Token } from "./tokens";
 import { RZSWAP_ABI, RZSWAP_ADDRESS, RZSWAP_CONFIGURED } from "./rzswap";
+import { ETH_HUB, ethGoldgrPath, ethHubConfigured } from "./hub";
 
 /**
  * Candidate intermediary hops tried when resolving a BSC swap path. Many RZ tokens have no direct
@@ -78,6 +79,38 @@ export async function bscUsdValue(token: Token, amount: bigint): Promise<number 
   try {
     const { amountOut } = await resolveBestBscPath(amount, token.address, USDT_BSC.address);
     return Number(formatUnits(amountOut, 18));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Quotes the fixed ETH GOLDGR path (USDT ↔ GOLDGR via WETH) on the ETH RzSwap vault.
+ * Leaves `resolveBestBscPath` untouched — GOLDGR never uses BSC path probing.
+ */
+export async function resolveEthGoldgrPath(amountIn: bigint, from: Token, to: Token): Promise<ResolvedRoute> {
+  if (!ethHubConfigured()) {
+    throw new Error("ETH RzSwap is not configured (set NEXT_PUBLIC_ETH_RZSWAP_ADDRESS / NEXT_PUBLIC_ETH_RZ_GATEWAY).");
+  }
+  const path = ethGoldgrPath(from, to);
+  const out = (await readContract(wagmiConfig, {
+    address: ETH_HUB.vault,
+    abi: RZSWAP_ABI,
+    functionName: "getOutputAmount",
+    args: [amountIn, path],
+    chainId: ETH_CHAIN_ID,
+  })) as bigint;
+  if (out <= 0n) throw new Error("No ETH GOLDGR quote — check treasury liquidity / pricing.");
+  return { path, amountOut: out };
+}
+
+/** Approximate USD of an ETH treasury amount (USDT 6-dec ≈ $1, GOLDGR via USDT quote). */
+export async function ethUsdValue(token: Token, amount: bigint): Promise<number | undefined> {
+  if (amount <= 0n) return 0;
+  if (tokenKey(token) === tokenKey(USDT_ETH)) return Number(formatUnits(amount, USDT_ETH.decimals));
+  try {
+    const { amountOut } = await resolveEthGoldgrPath(amount, token, USDT_ETH);
+    return Number(formatUnits(amountOut, USDT_ETH.decimals));
   } catch {
     return undefined;
   }

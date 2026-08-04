@@ -4,11 +4,23 @@ import { useEffect, useMemo, useState } from "react";
 import { formatUnits, parseEther, isAddress } from "viem";
 import { useAccount } from "wagmi";
 import { useDynamicContext, useUserWallets } from "@dynamic-labs/sdk-react-core";
-import { ALL_TOKENS, CHAIN_NAMES, USDT_BSC, isBscToken, isNative, isTronToken, tokenKey, type Token } from "@/lib/tokens";
+import {
+  ALL_TOKENS,
+  CHAIN_NAMES,
+  USDT_BSC,
+  isBscToken,
+  isNative,
+  isTronToken,
+  involvesGoldgr,
+  tokenKey,
+  type Token,
+} from "@/lib/tokens";
 import { isTronAddress } from "@/lib/tron/tronAddress";
 import { setTronSigner, tronSignerFromWallet } from "@/lib/tron/tronDynamic";
 import { friendlyRelayError, isAmountTooSmallError } from "@/lib/relayErrors";
 import { RZSWAP_CONFIGURED } from "@/lib/rzswap";
+import { GATEWAY_CONFIGURED } from "@/lib/gateway";
+import { ethHubConfigured, ethSellConfigured } from "@/lib/hub";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
 import { safeParseUnits, formatAmount, formatUsd, randomSwapId } from "@/lib/format";
 import { useQuote } from "@/hooks/useQuote";
@@ -85,18 +97,19 @@ export function SwapCard() {
 
   const { data: balances } = useBalances(ALL_TOKENS, address ?? undefined, tronAddr);
 
-  // Invariant: exactly one side must be a BNB Chain token.
+  // Invariant: non-GOLDGR routes need exactly one BSC side. GOLDGR pairs may be ETH↔ETH (local)
+  // or remote↔GOLDGR without a BSC token.
   function selectFrom(t: Token) {
     flow.reset();
     setFrom(t);
-    if (!isBscToken(t) && !isBscToken(to)) setTo(USDT_BSC);
+    if (!isBscToken(t) && !isBscToken(to) && !involvesGoldgr(t, to)) setTo(USDT_BSC);
     if (tokenKey(t) === tokenKey(to)) setTo(from);
     setPicker(null);
   }
   function selectTo(t: Token) {
     flow.reset();
     setTo(t);
-    if (!isBscToken(t) && !isBscToken(from)) setFrom(USDT_BSC);
+    if (!isBscToken(t) && !isBscToken(from) && !involvesGoldgr(from, t)) setFrom(USDT_BSC);
     if (tokenKey(t) === tokenKey(from)) setFrom(to);
     setPicker(null);
   }
@@ -110,7 +123,12 @@ export function SwapCard() {
   const debouncedAmountIn = useDebounced(amountIn, 400);
 
   const plan = useMemo(() => planSwap(from, to), [from, to]);
-  const isCrossChain = plan.kind === "inbound" || plan.kind === "outbound";
+  const isCrossChain =
+    plan.kind === "inbound" ||
+    plan.kind === "outbound" ||
+    plan.kind === "buy-goldgr" ||
+    plan.kind === "sell-goldgr" ||
+    plan.kind === "bsc-to-goldgr";
 
   // Destination recipient: the wallet auto-available on the destination chain (the Tron wallet for a
   // Tron destination, the EVM wallet otherwise), or a manually pasted address validated for that chain.
@@ -151,11 +169,19 @@ export function SwapCard() {
   }
 
   const rzswapNeeded = plan.legs.some((l) => l.kind === "rzswap") || (plan.kind === "inbound" && !plan.hubIsEndpoint);
-  const blockedByConfig = rzswapNeeded && !RZSWAP_CONFIGURED;
+  const goldgrRoute = involvesGoldgr(from, to);
+  const blockedByConfig = goldgrRoute
+    ? !ethHubConfigured() ||
+      (plan.kind === "sell-goldgr" && !ethSellConfigured()) ||
+      (plan.kind === "bsc-to-goldgr" && !GATEWAY_CONFIGURED)
+    : rzswapNeeded && !RZSWAP_CONFIGURED;
   const insufficient = fromBal != null && amountIn > fromBal;
 
   const canStart =
     sourceReady && destOk && plan.kind !== "invalid" && amountIn > 0n && !blockedByConfig && !insufficient && !quote.isError;
+
+  const isBuyKind = plan.kind === "inbound" || plan.kind === "buy-goldgr";
+  const isSellKind = plan.kind === "outbound" || plan.kind === "sell-goldgr";
 
   function mainAction() {
     if (!sourceReady) return setShowAuthFlow(true);
@@ -166,10 +192,9 @@ export function SwapCard() {
         to,
         amountIn,
         slippageBps,
-        // For a buy (inbound) the recipient is the destination BNB-Chain address; otherwise it's the
-        // connected EVM signer. For a sell to Tron, the Tron destination goes in `destAddress`.
-        address: (plan.kind === "inbound" ? destRecipient : address) as `0x${string}`,
-        destAddress: tronDest && plan.kind === "outbound" ? destRecipient : undefined,
+        // Buy: recipient is the destination hub address. Sell to Tron: Tron dest in destAddress.
+        address: (isBuyKind ? destRecipient : address) as `0x${string}`,
+        destAddress: tronDest && isSellKind ? destRecipient : undefined,
         tronAddress: tronSource ? tronAddr : undefined,
         swapId: randomSwapId(),
       });
@@ -182,7 +207,11 @@ export function SwapCard() {
 
   const buttonLabel = (() => {
     if (!sourceReady) return tronSource ? "Connect Tron wallet" : "Connect Wallet";
-    if (blockedByConfig) return "RzSwap not configured";
+    if (blockedByConfig) {
+      if (goldgrRoute && plan.kind === "sell-goldgr" && !ethSellConfigured()) return "ETH Relay depository not set";
+      if (goldgrRoute) return "ETH GOLDGR hub not configured";
+      return "RzSwap not configured";
+    }
     if (plan.kind === "invalid") return plan.error ?? "Invalid pair";
     if (amountIn === 0n) return "Enter an amount";
     if (insufficient) return `Insufficient ${from.symbol}`;
@@ -354,6 +383,16 @@ export function SwapCard() {
       {flow.status === "idle" && amountIn > 0n && plan.kind === "inbound" && !plan.hubIsEndpoint && (
         <p className="mt-2 text-center text-xs text-muted">
           One signature: Relay bridges to USDT and swaps it into {to.symbol} on BNB Chain (USDT back if it can&apos;t fill).
+        </p>
+      )}
+      {flow.status === "idle" && amountIn > 0n && plan.kind === "buy-goldgr" && (
+        <p className="mt-2 text-center text-xs text-muted">
+          One signature: Relay bridges to USDT on Ethereum and swaps it into GOLDGR.
+        </p>
+      )}
+      {flow.status === "idle" && amountIn > 0n && plan.kind === "bsc-to-goldgr" && (
+        <p className="mt-2 text-center text-xs text-muted">
+          One signature on BNB Chain: sell to USDT, bridge to Ethereum, and buy GOLDGR — no Ethereum wallet prompt.
         </p>
       )}
 

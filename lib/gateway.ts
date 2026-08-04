@@ -103,7 +103,8 @@ export function generateSwapId(): Hex {
 /**
  * BUY destination call: instruct Relay's router to approve the gateway for the full delivered USDT
  * and call fulfillBuy (allowance-pull). Use as the `txs` of a Relay quote where
- *   destinationChainId = 56, destinationCurrency = USDT, recipient = RELAY_ROUTER.
+ *   destinationCurrency = hub USDT, recipient = user (NOT the router — see useSwapFlow).
+ * Defaults preserve today's BSC buy. Pass `gateway` / `usdt` for the ETH GOLDGR hub.
  * `minOut` should come from RzSwap.getOutputAmount(bridgedMin, path) minus slippage tolerance.
  */
 export function buildBuyTxs(args: {
@@ -112,7 +113,16 @@ export function buildBuyTxs(args: {
   minOut: bigint;
   path: Address[];
   user: Address;
+  /** Destination hub gateway (default: BSC RzGateway). */
+  gateway?: Address;
+  /** Destination hub USDT (default: BSC USDT). */
+  usdt?: Address;
+  /** Relay router that executes cleanupErc20sViaCall (same address on BSC + ETH today). */
+  relayRouter?: Address;
 }): RelayCallTx[] {
+  const gateway = args.gateway ?? RZ_GATEWAY;
+  const usdt = args.usdt ?? USDT;
+  const router = args.relayRouter ?? RELAY_ROUTER;
   const fulfillData = encodeFunctionData({
     abi: RZ_GATEWAY_ABI,
     functionName: "fulfillBuy",
@@ -121,9 +131,9 @@ export function buildBuyTxs(args: {
   const cleanupData = encodeFunctionData({
     abi: CLEANUP_VIA_CALL_ABI,
     functionName: "cleanupErc20sViaCall",
-    args: [[USDT], [RZ_GATEWAY], [fulfillData], [0n]],
+    args: [[usdt], [gateway], [fulfillData], [0n]],
   });
-  return [{ to: RELAY_ROUTER, value: "0", data: cleanupData }];
+  return [{ to: router, value: "0", data: cleanupData }];
 }
 
 /**

@@ -207,24 +207,33 @@ export type RelaySellDeposit = { depository: `0x${string}`; data: `0x${string}`;
 export async function getRelaySellDeposit(input: {
   depositor: string;
   recipient: string;
-  originCurrency: string; // USDT on BSC
-  amount: string; // base units used for the destination quote (swap's guaranteed minimum)
+  originCurrency: string; // USDT on the origin hub
+  amount: string; // base units used for the destination quote (swap's expected output)
   toChainId: number;
   toCurrency: string;
+  /** Origin chain of the adapter deposit (default BSC 56; pass 1 for ETH GOLDGR sells). */
+  originChainId?: number;
+  /** Destination-chain calls (e.g. fulfillBuy on the other hub). */
+  txs?: RelayCallTx[];
+  refundOnOrigin?: boolean;
 }): Promise<RelaySellDeposit> {
+  const body: Record<string, unknown> = {
+    user: input.depositor,
+    recipient: input.recipient,
+    originChainId: input.originChainId ?? 56,
+    destinationChainId: input.toChainId,
+    originCurrency: input.originCurrency,
+    destinationCurrency: input.toCurrency,
+    amount: input.amount,
+    tradeType: "EXACT_INPUT",
+  };
+  if (input.txs?.length) body.txs = input.txs;
+  if (input.refundOnOrigin != null) body.options = { refundOnOrigin: input.refundOnOrigin };
+
   const res = await fetch("https://api.relay.link/quote", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      user: input.depositor,
-      recipient: input.recipient,
-      originChainId: 56,
-      destinationChainId: input.toChainId,
-      originCurrency: input.originCurrency,
-      destinationCurrency: input.toCurrency,
-      amount: input.amount,
-      tradeType: "EXACT_INPUT",
-    }),
+    body: JSON.stringify(body),
   });
   const j = await res.json();
   if (!res.ok || j?.message) throw new Error(`Relay sell quote failed: ${j?.message ?? res.status}`);
