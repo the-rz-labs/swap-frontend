@@ -21,7 +21,7 @@ import { friendlyRelayError, isAmountTooSmallError } from "@/lib/relayErrors";
 import { RZSWAP_CONFIGURED } from "@/lib/rzswap";
 import { GATEWAY_CONFIGURED } from "@/lib/gateway";
 import { ethHubConfigured, ethSellConfigured } from "@/lib/hub";
-import { planSwap, applySlippage } from "@/lib/swapPlan";
+import { planSwap } from "@/lib/swapPlan";
 import { safeParseUnits, formatAmount, formatUsd, randomSwapId } from "@/lib/format";
 import { useQuote } from "@/hooks/useQuote";
 import { useSwapFlow } from "@/hooks/useSwapFlow";
@@ -146,12 +146,12 @@ export function SwapCard() {
   const debouncedDestAddr = useDebounced(destEntered, 400);
   const debouncedDestValid = tronDest ? isTronAddress(debouncedDestAddr) : isAddress(debouncedDestAddr);
   const quoteRecipient = connectedDest ?? (debouncedDestValid ? debouncedDestAddr : undefined);
-  const quote = useQuote(from, to, debouncedAmountIn, quoteRecipient);
+  const quote = useQuote(from, to, debouncedAmountIn, quoteRecipient, slippageBps);
 
   const routeDetail = plan.legs.map((l) => l.detail).join("  →  ") || "—";
 
   const output = quote.data?.output;
-  const minReceived = output != null ? applySlippage(output, slippageBps) : undefined;
+  const minReceived = quote.data?.minOutput;
   const priceDiff =
     quote.data?.inputUsd && quote.data?.outputUsd && quote.data.inputUsd > 0
       ? ((quote.data.outputUsd - quote.data.inputUsd) / quote.data.inputUsd) * 100

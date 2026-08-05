@@ -162,10 +162,33 @@ export function relayOutputAmount(quote: Execute): bigint | undefined {
   return raw != null ? BigInt(raw) : undefined;
 }
 
-/** Minimum guaranteed output (base units) of a Relay quote, if present. */
+/**
+ * Minimum guaranteed output (base units) of a Relay quote, if present.
+ * Prefers the lowest of `currencyOut.minimumAmount` and
+ * `route.destination.(input|output)Currency.minimumAmount` — Relay sometimes mirrors
+ * `minimumAmount === amount` on currencyOut while the real floor lives on the route.
+ */
 export function relayMinimumOutput(quote: Execute): bigint | undefined {
-  const raw = quote.details?.currencyOut?.minimumAmount;
-  return raw != null ? BigInt(raw) : undefined;
+  const candidates: bigint[] = [];
+  const top = quote.details?.currencyOut?.minimumAmount;
+  if (top != null && top !== "") candidates.push(BigInt(top));
+
+  const dest = (
+    quote.details as {
+      route?: {
+        destination?: {
+          inputCurrency?: { minimumAmount?: string };
+          outputCurrency?: { minimumAmount?: string };
+        };
+      };
+    } | undefined
+  )?.route?.destination;
+  for (const raw of [dest?.inputCurrency?.minimumAmount, dest?.outputCurrency?.minimumAmount]) {
+    if (raw != null && raw !== "") candidates.push(BigInt(raw));
+  }
+
+  if (candidates.length === 0) return undefined;
+  return candidates.reduce((a, b) => (a < b ? a : b));
 }
 
 /** USD values of the input/output currencies from a Relay quote, if present. */
@@ -178,13 +201,32 @@ export function relayUsd(quote: Execute): { inUsd?: number; outUsd?: number } {
   };
 }
 
+function feeUsdField(fee: { amountUsd?: string } | undefined): number | undefined {
+  if (fee?.amountUsd == null || fee.amountUsd === "") return undefined;
+  const n = Number(fee.amountUsd);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 /**
- * Total bridge fee in USD for a Relay quote — what the user loses moving the asset across chains,
- * i.e. input USD minus output USD. For a same-asset bridge (USDT→USDT) this is the pure network/
- * relayer fee (dominated, for Tron, by a ~$0.15 fixed cost to deliver USDT). Returns undefined when
- * the quote lacks USD pricing.
+ * Bridge fee in USD from a Relay quote.
+ * Prefers Relay's explicit `fees.relayer` (relayerGas + relayerService rolled up), then
+ * `details.totalImpact.usd`, then currencyIn−currencyOut as a last resort.
+ * Does NOT include origin wallet `fees.gas` (BNB/ETH the user pays to submit the deposit).
  */
 export function relayFeeUsd(quote: Execute): number | undefined {
+  const relayer = feeUsdField(quote.fees?.relayer);
+  if (relayer != null && relayer >= 0) return relayer;
+
+  const gas = feeUsdField(quote.fees?.relayerGas);
+  const service = feeUsdField(quote.fees?.relayerService);
+  if (gas != null || service != null) return Math.max(0, (gas ?? 0) + (service ?? 0));
+
+  const impact = quote.details?.totalImpact?.usd;
+  if (impact != null && impact !== "") {
+    const n = Math.abs(Number(impact));
+    if (Number.isFinite(n)) return n;
+  }
+
   const { inUsd, outUsd } = relayUsd(quote);
   if (inUsd == null || outUsd == null) return undefined;
   return Math.max(0, inUsd - outUsd);
@@ -206,6 +248,12 @@ export type RelaySellDeposit = { depository: `0x${string}`; data: `0x${string}`;
 
 export async function getRelaySellDeposit(input: {
   depositor: string;
+  /**
+   * Origin-chain address that receives Relay's async refund if the destination fill fails.
+   * MUST be the end user — never the adapter. `user` stays the adapter (on-chain depositor);
+   * without `refundTo`, refunds land on the adapter and get stuck.
+   */
+  refundTo: string;
   recipient: string;
   originCurrency: string; // USDT on the origin hub
   amount: string; // base units used for the destination quote (swap's expected output)
@@ -215,10 +263,12 @@ export async function getRelaySellDeposit(input: {
   originChainId?: number;
   /** Destination-chain calls (e.g. fulfillBuy on the other hub). */
   txs?: RelayCallTx[];
+  /** Prefer origin-chain refund on dest failure (default true). */
   refundOnOrigin?: boolean;
 }): Promise<RelaySellDeposit> {
   const body: Record<string, unknown> = {
     user: input.depositor,
+    refundTo: input.refundTo,
     recipient: input.recipient,
     originChainId: input.originChainId ?? 56,
     destinationChainId: input.toChainId,
@@ -226,9 +276,9 @@ export async function getRelaySellDeposit(input: {
     destinationCurrency: input.toCurrency,
     amount: input.amount,
     tradeType: "EXACT_INPUT",
+    options: { refundOnOrigin: input.refundOnOrigin ?? true },
   };
   if (input.txs?.length) body.txs = input.txs;
-  if (input.refundOnOrigin != null) body.options = { refundOnOrigin: input.refundOnOrigin };
 
   const res = await fetch("https://api.relay.link/quote", {
     method: "POST",
@@ -241,6 +291,23 @@ export async function getRelaySellDeposit(input: {
   const item = dep?.items?.[0]?.data;
   if (!item?.to || !item?.data) throw new Error("Relay returned no deposit step for the sell.");
   return { depository: item.to, data: toFullBalanceDeposit(item.data as Hex), value: item.value ?? "0" };
+}
+
+/**
+ * Reject dust sells where Relay's fixed fees would dominate — those fills often revert on dest
+ * `minOut` and force an origin USDT refund (original token already swapped).
+ */
+export function assertBridgeSizeOk(quote: Execute, label = "swap"): void {
+  const { inUsd, outUsd } = relayUsd(quote);
+  const fee = relayFeeUsd(quote);
+  if (outUsd != null && outUsd < 2) {
+    throw new Error(`Amount too small for a cross-chain ${label} — try at least ~$2 after bridge fees.`);
+  }
+  if (inUsd != null && fee != null && inUsd > 0 && fee / inUsd > 0.2) {
+    throw new Error(
+      `Bridge fees are too high for this size (~${Math.round((fee / inUsd) * 100)}% of input). Try a larger amount.`,
+    );
+  }
 }
 
 /** True once every step of an executed quote is complete. */

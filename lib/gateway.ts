@@ -2,11 +2,12 @@
  * RzGateway — the single contract the frontend uses for ALL swaps (local / buy / sell).
  *
  *  - LOCAL : RzGateway.swapLocal(...)                          (1 approve + 1 call)
- *  - BUY   : a Relay order whose destination call is the router's cleanupErc20sViaCall, which
- *            APPROVES the gateway for the full bridged USDT and calls fulfillBuy (allowance-pull).
+ *  - BUY BSC : Relay cleanupErc20sViaCall → gateway.fulfillBuy (approve-then-call; BSC USDT OK)
+ *  - BUY ETH : Relay cleanupErc20s (safeTransfer) → EthUsdtFillAdapter.fill → gateway.fulfillBuy
+ *              (mainnet USDT breaks raw approve inside cleanupErc20sViaCall)
  *  - SELL  : RzGateway.sell(...) — swaps token->USDT via the engine then bridges out via the adapter.
  *
- * See docs/DESIGN.md for the verified Relay delivery model (approve-then-call, not transfer).
+ * See docs/DESIGN.md for the verified Relay delivery model.
  */
 import { type Address, type Hex, encodeFunctionData, encodeAbiParameters } from "viem";
 import { USDT_BSC, BSC_CHAIN_ID } from "./tokens";
@@ -21,6 +22,9 @@ export const RELAY_DEPOSIT_ADAPTER = (process.env.NEXT_PUBLIC_RELAY_DEPOSIT_ADAP
 /// Relay's RelayRouterV3 on BSC — executes the buy's destination call (cleanupErc20sViaCall).
 export const RELAY_ROUTER = (process.env.NEXT_PUBLIC_RELAY_ROUTER ??
   "0xb92fe925DC43a0ECdE6c8b1a2709c170Ec4fFf4f") as Address;
+/// ETH-only: USDT-safe fill proxy (cleanupErc20s → fill → gateway).
+export const ETH_USDT_FILL_ADAPTER = (process.env.NEXT_PUBLIC_ETH_USDT_FILL_ADAPTER ??
+  "0x4E221f8270737aA478F7967FE04Bb1707f30E993") as Address;
 
 export const GATEWAY_CONFIGURED = RZ_GATEWAY !== ZERO;
 export const BUY_DESTINATION_CHAIN = BSC_CHAIN_ID;
@@ -75,7 +79,7 @@ export const RZ_GATEWAY_ABI = [
 ] as const;
 
 /// Relay RelayRouterV3.cleanupErc20sViaCall — for amount 0 it approves `to` for the router's full
-/// `token` balance, then calls `to` with `data`. Used to fund + invoke fulfillBuy in one router op.
+/// `token` balance, then calls `to` with `data`. Used on BSC (USDT returns bool).
 const CLEANUP_VIA_CALL_ABI = [
   {
     type: "function",
@@ -91,6 +95,39 @@ const CLEANUP_VIA_CALL_ABI = [
   },
 ] as const;
 
+/// Relay RelayRouterV3.cleanupErc20s — safeTransfer full balance (amount 0). USDT-safe on ETH.
+/// Live router uses the 4-arg form (trailing `bytes`); the 3-arg form is NOT deployed.
+const CLEANUP_ERC20S_ABI = [
+  {
+    type: "function",
+    name: "cleanupErc20s",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "tokens", type: "address[]" },
+      { name: "recipients", type: "address[]" },
+      { name: "amounts", type: "uint256[]" },
+      { name: "data", type: "bytes" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+const ETH_FILL_ADAPTER_ABI = [
+  {
+    type: "function",
+    name: "fill",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "swapId", type: "bytes32" },
+      { name: "tokenOut", type: "address" },
+      { name: "minOut", type: "uint256" },
+      { name: "path", type: "address[]" },
+      { name: "user", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /** Random 32-byte swapId for backend reconciliation (echoed in SwapExecuted). */
@@ -101,11 +138,8 @@ export function generateSwapId(): Hex {
 }
 
 /**
- * BUY destination call: instruct Relay's router to approve the gateway for the full delivered USDT
- * and call fulfillBuy (allowance-pull). Use as the `txs` of a Relay quote where
- *   destinationCurrency = hub USDT, recipient = user (NOT the router — see useSwapFlow).
- * Defaults preserve today's BSC buy. Pass `gateway` / `usdt` for the ETH GOLDGR hub.
- * `minOut` should come from RzSwap.getOutputAmount(bridgedMin, path) minus slippage tolerance.
+ * BUY destination call (BSC): router cleanupErc20sViaCall → gateway.fulfillBuy.
+ * `recipient` on the Relay quote MUST be the user, NOT the router.
  */
 export function buildBuyTxs(args: {
   swapId: Hex;
@@ -134,6 +168,41 @@ export function buildBuyTxs(args: {
     args: [[usdt], [gateway], [fulfillData], [0n]],
   });
   return [{ to: router, value: "0", data: cleanupData }];
+}
+
+/**
+ * BUY destination calls (ETH): avoid cleanupErc20sViaCall (raw approve breaks on mainnet USDT).
+ *   1. router.cleanupErc20s → safeTransfer full USDT to EthUsdtFillAdapter
+ *   2. fillAdapter.fill → forceApprove(gateway) + fulfillBuy
+ */
+export function buildEthBuyTxs(args: {
+  swapId: Hex;
+  tokenOut: Address;
+  minOut: bigint;
+  path: Address[];
+  user: Address;
+  usdt: Address;
+  fillAdapter: Address;
+  relayRouter?: Address;
+}): RelayCallTx[] {
+  if (!args.fillAdapter || args.fillAdapter === ZERO) {
+    throw new Error("ETH USDT fill adapter is not configured (NEXT_PUBLIC_ETH_USDT_FILL_ADAPTER).");
+  }
+  const router = args.relayRouter ?? RELAY_ROUTER;
+  const cleanupData = encodeFunctionData({
+    abi: CLEANUP_ERC20S_ABI,
+    functionName: "cleanupErc20s",
+    args: [[args.usdt], [args.fillAdapter], [0n], "0x"],
+  });
+  const fillData = encodeFunctionData({
+    abi: ETH_FILL_ADAPTER_ABI,
+    functionName: "fill",
+    args: [args.swapId, args.tokenOut, args.minOut, args.path, args.user],
+  });
+  return [
+    { to: router, value: "0", data: cleanupData },
+    { to: args.fillAdapter, value: "0", data: fillData },
+  ];
 }
 
 /**
