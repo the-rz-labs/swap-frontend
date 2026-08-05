@@ -56,8 +56,16 @@ export const ETH_HUB: Hub = {
   weth: WETH_ADDRESS,
 };
 
+/** ETH buy fill proxy — required for USDT→GOLDGR (and other ETH hub buys). */
+export const ETH_USDT_FILL_ADAPTER = (process.env.NEXT_PUBLIC_ETH_USDT_FILL_ADAPTER ??
+  "0x4E221f8270737aA478F7967FE04Bb1707f30E993") as Address;
+
 export function ethHubConfigured(): boolean {
   return ETH_HUB.gateway !== ZERO && ETH_HUB.vault !== ZERO;
+}
+
+export function ethBuyFillConfigured(): boolean {
+  return ethHubConfigured() && ETH_USDT_FILL_ADAPTER !== ZERO;
 }
 
 export function ethSellConfigured(): boolean {

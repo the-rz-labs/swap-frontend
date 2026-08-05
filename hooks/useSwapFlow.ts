@@ -26,18 +26,25 @@ import { tronAdaptedWallet } from "@/lib/tron/tronAdaptedWallet";
 import type { RelayWallet } from "@/lib/relay";
 import { ERC20_ABI } from "@/lib/rzswap";
 import { resolveBestBscPath, resolveEthGoldgrPath } from "@/lib/route";
-import { getRelayQuote, executeRelay, relayOutputAmount, relayMinimumOutput, getRelaySellDeposit } from "@/lib/relay";
+import { getRelayQuote, executeRelay, relayOutputAmount, getRelaySellDeposit, assertBridgeSizeOk } from "@/lib/relay";
+import {
+  quoteRelayThenGoldgr,
+  quoteRelayThenBscToken,
+  buildDestFillProbeTxs,
+  buildEthDestFillProbeTxs,
+} from "@/lib/relayDestFill";
 import { isBenignRelaySolverError, friendlyRelayError } from "@/lib/relayErrors";
 import { planSwap, applySlippage } from "@/lib/swapPlan";
 import {
   buildBuyTxs,
+  buildEthBuyTxs,
   buildSellExtraData,
   RZ_GATEWAY,
   RZ_GATEWAY_ABI,
   RELAY_DEPOSIT_ADAPTER,
   GATEWAY_CONFIGURED,
 } from "@/lib/gateway";
-import { ETH_HUB, ethHubConfigured, ethSellConfigured } from "@/lib/hub";
+import { ETH_HUB, ETH_USDT_FILL_ADAPTER, ethHubConfigured, ethBuyFillConfigured, ethSellConfigured } from "@/lib/hub";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
 
@@ -252,8 +259,13 @@ export function useSwapFlow() {
         }
         const wallet = await sourceWallet(ctx);
 
-        // 1. Estimate the USDT delivered on BSC — use the GUARANTEED minimum so the token floor stays
-        //    safe even if the bridge delivers a touch less than quoted.
+        const { path } = await resolveBestBscPath(1n, USDT_BSC.address, ctx.to.address);
+        const probeTxs = buildDestFillProbeTxs({
+          swapId: ctx.swapId,
+          tokenOut: ctx.to.address as `0x${string}`,
+          path,
+          user: ctx.address,
+        });
         const estimate = await getRelayQuote({
           fromChainId: ctx.from.chainId,
           fromCurrency: ctx.from.address,
@@ -261,24 +273,19 @@ export function useSwapFlow() {
           toCurrency: USDT_BSC.address,
           amount: ctx.amountIn.toString(),
           recipient: ctx.address,
+          txs: probeTxs,
+          refundOnOrigin: true,
           wallet,
         });
-        const minUsdt = relayMinimumOutput(estimate) ?? relayOutputAmount(estimate);
-        if (!minUsdt || minUsdt <= 0n) throw new Error("Could not estimate the bridged USDT amount.");
+        const fill = await quoteRelayThenBscToken(estimate, ctx.to, ctx.slippageBps);
 
-        // 2. Compute the token floor for that USDT via the treasury's pricing path.
-        const { path, amountOut: quotedToken } = await resolveBestBscPath(minUsdt, USDT_BSC.address, ctx.to.address);
-        const minOut = applySlippage(quotedToken, ctx.slippageBps);
-
-        // 3. Quote bridge → USDT WITH the router cleanupErc20sViaCall destination call (approves the
-        //    gateway for the full delivered USDT and calls fulfillBuy), then execute.
-        //    `recipient` MUST be the user, NOT the Relay router: Relay maps `recipient` onto the
-        //    router's `nftRecipient`, and RelayRouterV3.multicall reverts `InvalidRecipient` if that
-        //    equals the router itself — which reverts the whole fill (before fulfillBuy runs) and
-        //    refunds the source. The bridged USDT lands in the router via permit2 regardless of
-        //    `recipient`; the destination call (buyTxs.to = router) consumes it. See test/BuyReplayFull
-        //    (reproduces the revert) and test/BuyRecipientFix (proves recipient=user resolves).
-        const buyTxs = buildBuyTxs({ swapId: ctx.swapId, tokenOut: ctx.to.address as `0x${string}`, minOut, path, user: ctx.address });
+        const buyTxs = buildBuyTxs({
+          swapId: ctx.swapId,
+          tokenOut: ctx.to.address as `0x${string}`,
+          minOut: fill.minOutput,
+          path: fill.path,
+          user: ctx.address,
+        });
         const quote = await getRelayQuote({
           fromChainId: ctx.from.chainId,
           fromCurrency: ctx.from.address,
@@ -351,6 +358,7 @@ export function useSwapFlow() {
         //    still floored at minUsdt, so it fail-safe reverts rather than under-delivering.
         const dep = await getRelaySellDeposit({
           depositor: RELAY_DEPOSIT_ADAPTER,
+          refundTo: ctx.address,
           recipient: relayRecipient,
           originCurrency: USDT_BSC.address,
           amount: expectedUsdt.toString(),
@@ -422,15 +430,28 @@ export function useSwapFlow() {
   );
 
   /**
-   * BUY GOLDGR: Relay → USDT(ETH) + ETH fulfillBuy. Same approve-then-call model as BSC buys;
-   * destination hub is ETH_HUB.
+   * BUY GOLDGR: Relay → USDT(ETH) + EthUsdtFillAdapter → fulfillBuy.
+   * Uses cleanupErc20s (safeTransfer) — not cleanupErc20sViaCall (broken on mainnet USDT).
    */
   const makeRelayBuyGoldgrLeg = useCallback(
     (ctx: SwapContext, legIndex: number): LegRunner =>
       async () => {
-        if (!ethHubConfigured()) throw new Error("ETH GOLDGR hub is not configured.");
+        if (!ethBuyFillConfigured()) {
+          throw new Error(
+            "ETH GOLDGR buy is not configured — set NEXT_PUBLIC_ETH_USDT_FILL_ADAPTER (and ETH gateway/vault).",
+          );
+        }
         const wallet = await sourceWallet(ctx);
 
+        const { path } = await resolveEthGoldgrPath(1n, USDT_ETH, GOLDGR);
+        const probeTxs = buildEthDestFillProbeTxs({
+          swapId: ctx.swapId,
+          tokenOut: GOLDGR.address as `0x${string}`,
+          path,
+          user: ctx.address,
+          usdt: USDT_ETH.address as `0x${string}`,
+          fillAdapter: ETH_USDT_FILL_ADAPTER,
+        });
         const estimate = await getRelayQuote({
           fromChainId: ctx.from.chainId,
           fromCurrency: ctx.from.address,
@@ -438,22 +459,21 @@ export function useSwapFlow() {
           toCurrency: USDT_ETH.address,
           amount: ctx.amountIn.toString(),
           recipient: ctx.address,
+          txs: probeTxs,
+          refundOnOrigin: true,
           wallet,
         });
-        const minUsdt = relayMinimumOutput(estimate) ?? relayOutputAmount(estimate);
-        if (!minUsdt || minUsdt <= 0n) throw new Error("Could not estimate the bridged USDT amount.");
+        assertBridgeSizeOk(estimate, "GOLDGR buy");
+        const fill = await quoteRelayThenGoldgr(estimate, ctx.slippageBps);
 
-        const { path, amountOut: quotedToken } = await resolveEthGoldgrPath(minUsdt, USDT_ETH, GOLDGR);
-        const minOut = applySlippage(quotedToken, ctx.slippageBps);
-
-        const buyTxs = buildBuyTxs({
+        const buyTxs = buildEthBuyTxs({
           swapId: ctx.swapId,
           tokenOut: GOLDGR.address as `0x${string}`,
-          minOut,
-          path,
+          minOut: fill.minOutput,
+          path: fill.path,
           user: ctx.address,
-          gateway: ETH_HUB.gateway,
           usdt: USDT_ETH.address as `0x${string}`,
+          fillAdapter: ETH_USDT_FILL_ADAPTER,
         });
         const quote = await getRelayQuote({
           fromChainId: ctx.from.chainId,
@@ -517,7 +537,13 @@ export function useSwapFlow() {
         let txs: ReturnType<typeof buildBuyTxs> | undefined;
 
         if (destIsBscToken) {
-          // Bridge USDT to BSC, then fulfillBuy into the BSC token.
+          const { path: bscPath } = await resolveBestBscPath(1n, USDT_BSC.address, ctx.to.address);
+          const probeTxs = buildDestFillProbeTxs({
+            swapId: ctx.swapId,
+            tokenOut: ctx.to.address as `0x${string}`,
+            path: bscPath,
+            user: ctx.address,
+          });
           const minUsdtBscEstimate = await getRelayQuote({
             fromChainId: ETH_CHAIN_ID,
             fromCurrency: USDT_ETH.address,
@@ -525,20 +551,16 @@ export function useSwapFlow() {
             toCurrency: USDT_BSC.address,
             amount: expectedUsdt.toString(),
             recipient: ctx.address,
+            txs: probeTxs,
+            refundOnOrigin: true,
           });
-          const minBscUsdt = relayMinimumOutput(minUsdtBscEstimate) ?? relayOutputAmount(minUsdtBscEstimate);
-          if (!minBscUsdt || minBscUsdt <= 0n) throw new Error("Could not estimate bridged BSC USDT.");
-          const { path: bscPath, amountOut: quotedToken } = await resolveBestBscPath(
-            minBscUsdt,
-            USDT_BSC.address,
-            ctx.to.address,
-          );
-          const minOut = applySlippage(quotedToken, ctx.slippageBps);
+          assertBridgeSizeOk(minUsdtBscEstimate, "GOLDGR sell");
+          const fill = await quoteRelayThenBscToken(minUsdtBscEstimate, ctx.to, ctx.slippageBps);
           txs = buildBuyTxs({
             swapId: ctx.swapId,
             tokenOut: ctx.to.address as `0x${string}`,
-            minOut,
-            path: bscPath,
+            minOut: fill.minOutput,
+            path: fill.path,
             user: ctx.address,
           });
           toChainId = BSC_CHAIN_ID;
@@ -547,6 +569,7 @@ export function useSwapFlow() {
 
         const dep = await getRelaySellDeposit({
           depositor: ETH_HUB.adapter,
+          refundTo: ctx.address,
           recipient: relayRecipient,
           originCurrency: USDT_ETH.address,
           amount: expectedUsdt.toString(),
@@ -554,7 +577,6 @@ export function useSwapFlow() {
           toCurrency,
           originChainId: ETH_CHAIN_ID,
           txs,
-          refundOnOrigin: txs ? true : undefined,
         });
         const extraData = buildSellExtraData(dep.depository, ctx.address, dep.data);
 
@@ -591,7 +613,11 @@ export function useSwapFlow() {
     (ctx: SwapContext, legIndex: number): LegRunner =>
       async () => {
         if (!GATEWAY_CONFIGURED) throw new Error("BSC gateway is not configured.");
-        if (!ethHubConfigured()) throw new Error("ETH GOLDGR hub is not configured.");
+        if (!ethBuyFillConfigured()) {
+          throw new Error(
+            "ETH GOLDGR buy is not configured — set NEXT_PUBLIC_ETH_USDT_FILL_ADAPTER (and ETH gateway/vault).",
+          );
+        }
         await ensureChain(BSC_CHAIN_ID);
 
         const { path, amountOut: expectedUsdt } = await resolveBestBscPath(
@@ -602,6 +628,15 @@ export function useSwapFlow() {
         const minUsdt = applySlippage(expectedUsdt, ctx.slippageBps);
         if (minUsdt <= 0n) throw new Error("Swap quote returned zero — try a larger amount.");
 
+        const { path: ethPath } = await resolveEthGoldgrPath(1n, USDT_ETH, GOLDGR);
+        const probeTxs = buildEthDestFillProbeTxs({
+          swapId: ctx.swapId,
+          tokenOut: GOLDGR.address as `0x${string}`,
+          path: ethPath,
+          user: ctx.address,
+          usdt: USDT_ETH.address as `0x${string}`,
+          fillAdapter: ETH_USDT_FILL_ADAPTER,
+        });
         const bridgeEst = await getRelayQuote({
           fromChainId: BSC_CHAIN_ID,
           fromCurrency: USDT_BSC.address,
@@ -609,25 +644,25 @@ export function useSwapFlow() {
           toCurrency: USDT_ETH.address,
           amount: expectedUsdt.toString(),
           recipient: ctx.address,
+          txs: probeTxs,
+          refundOnOrigin: true,
         });
-        const minEthUsdt = relayMinimumOutput(bridgeEst) ?? relayOutputAmount(bridgeEst);
-        if (!minEthUsdt || minEthUsdt <= 0n) throw new Error("Could not estimate bridged ETH USDT.");
+        assertBridgeSizeOk(bridgeEst, "GOLDGR buy");
+        const fill = await quoteRelayThenGoldgr(bridgeEst, ctx.slippageBps);
 
-        const { path: ethPath, amountOut: quotedGold } = await resolveEthGoldgrPath(minEthUsdt, USDT_ETH, GOLDGR);
-        const minOut = applySlippage(quotedGold, ctx.slippageBps);
-
-        const buyTxs = buildBuyTxs({
+        const buyTxs = buildEthBuyTxs({
           swapId: ctx.swapId,
           tokenOut: GOLDGR.address as `0x${string}`,
-          minOut,
-          path: ethPath,
+          minOut: fill.minOutput,
+          path: fill.path,
           user: ctx.address,
-          gateway: ETH_HUB.gateway,
           usdt: USDT_ETH.address as `0x${string}`,
+          fillAdapter: ETH_USDT_FILL_ADAPTER,
         });
 
         const dep = await getRelaySellDeposit({
           depositor: RELAY_DEPOSIT_ADAPTER,
+          refundTo: ctx.address,
           recipient: ctx.address,
           originCurrency: USDT_BSC.address,
           amount: expectedUsdt.toString(),
@@ -635,7 +670,6 @@ export function useSwapFlow() {
           toCurrency: USDT_ETH.address,
           originChainId: BSC_CHAIN_ID,
           txs: buyTxs,
-          refundOnOrigin: true,
         });
         const extraData = buildSellExtraData(dep.depository, ctx.address, dep.data);
         const recipientBytes = encodePacked(["address"], [ctx.address]);
