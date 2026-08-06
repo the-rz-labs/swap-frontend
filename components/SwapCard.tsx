@@ -8,6 +8,7 @@ import {
   ALL_TOKENS,
   CHAIN_NAMES,
   USDT_BSC,
+  canonicalToken,
   isBscToken,
   isNative,
   isTronToken,
@@ -82,8 +83,11 @@ export function SwapCard() {
     };
   }, [tronWallet]);
 
-  const [from, setFrom] = useState<Token>(ALL_TOKENS.find((t) => t.symbol === "ETH")!);
-  const [to, setTo] = useState<Token>(ALL_TOKENS.find((t) => t.symbol === "CAR" && isBscToken(t))!);
+  const [fromRaw, setFrom] = useState<Token>(ALL_TOKENS.find((t) => t.symbol === "ETH")!);
+  const [toRaw, setTo] = useState<Token>(ALL_TOKENS.find((t) => t.symbol === "CAR" && isBscToken(t))!);
+  // Always read decimals/metadata from ALL_TOKENS (stale picker state kept 18-dec MGC → "You receive 0").
+  const from = canonicalToken(fromRaw);
+  const to = canonicalToken(toRaw);
   const [amount, setAmount] = useState("");
   const [slippageBps, setSlippageBps] = useState(100);
   const [picker, setPicker] = useState<"from" | "to" | null>(null);

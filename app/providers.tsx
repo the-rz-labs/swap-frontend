@@ -7,7 +7,7 @@ import { DynamicContextProvider } from "@dynamic-labs/sdk-react-core";
 import { EthereumWalletConnectors } from "@dynamic-labs/ethereum";
 import { TronWalletConnectors } from "@dynamic-labs/tron";
 import { DynamicWagmiConnector } from "@dynamic-labs/wagmi-connector";
-import { wagmiConfig } from "@/lib/wagmi";
+import { wagmiConfig, ETH_RPC } from "@/lib/wagmi";
 import { installRelayRejectionGuard } from "@/lib/relayErrors";
 
 const queryClient = new QueryClient();
@@ -83,7 +83,9 @@ export function Providers({ children }: { children: ReactNode }) {
               name: "Ethereum",
               nativeCurrency: { decimals: 18, name: "Ether", symbol: "ETH" },
               networkId: 1,
-              rpcUrls: [process.env.NEXT_PUBLIC_ETH_RPC || "https://ethereum-rpc.publicnode.com"],
+              // Prefer publicnode — MetaMask may ignore this for the built-in Ethereum network and keep
+              // a gated custom RPC (Ankr Unauthorized); see friendlyRelayError for the user hint.
+              rpcUrls: [ETH_RPC, "https://ethereum.publicnode.com", "https://1rpc.io/eth"],
               vanityName: "Ethereum",
             },
           ],

@@ -15,7 +15,7 @@ import {
   type Token,
 } from "@/lib/tokens";
 import { isTronAddress } from "@/lib/tron/tronAddress";
-import { resolveBestBscPath, resolveEthGoldgrPath, bscUsdValue, ethUsdValue } from "@/lib/route";
+import { resolveBestBscPath, resolveBestBscUsdtPath, resolveEthGoldgrPath, bscUsdValue, ethUsdValue } from "@/lib/route";
 import { getRelayQuote, relayOutputAmount, relayMinimumOutput, relayUsd, relayFeeUsd } from "@/lib/relay";
 import {
   quoteRelayThenGoldgr,
@@ -25,7 +25,7 @@ import {
   DEST_FILL_QUOTE_SWAP_ID,
 } from "@/lib/relayDestFill";
 import { classify, applySlippage } from "@/lib/swapPlan";
-import { ETH_USDT_FILL_ADAPTER, ethBuyFillConfigured } from "@/lib/hub";
+import { ETH_USDT_FILL_ADAPTER, ethBuyFillConfigured, ethGoldgrPath } from "@/lib/hub";
 
 /** Non-zero stand-in when quoting without a connected wallet (fulfillBuy rejects address(0)). */
 const QUOTE_USER_FALLBACK = "0x1111111111111111111111111111111111111111" as Address;
@@ -78,7 +78,7 @@ async function computeGoldgrQuote(
     if (!ethBuyFillConfigured()) {
       throw new Error("ETH GOLDGR buy is not configured — set NEXT_PUBLIC_ETH_USDT_FILL_ADAPTER.");
     }
-    const { path } = await resolveEthGoldgrPath(1n, USDT_ETH, GOLDGR);
+    const path = ethGoldgrPath(USDT_ETH, GOLDGR);
     const probeTxs = buildEthDestFillProbeTxs({
       swapId: DEST_FILL_QUOTE_SWAP_ID,
       tokenOut: GOLDGR.address as Address,
@@ -115,7 +115,7 @@ async function computeGoldgrQuote(
       throw new Error("ETH GOLDGR buy is not configured — set NEXT_PUBLIC_ETH_USDT_FILL_ADAPTER.");
     }
     const { amountOut: hubBsc } = await resolveBestBscPath(amountIn, from.address, USDT_BSC.address);
-    const { path } = await resolveEthGoldgrPath(1n, USDT_ETH, GOLDGR);
+    const path = ethGoldgrPath(USDT_ETH, GOLDGR);
     const probeTxs = buildEthDestFillProbeTxs({
       swapId: DEST_FILL_QUOTE_SWAP_ID,
       tokenOut: GOLDGR.address as Address,
@@ -150,7 +150,7 @@ async function computeGoldgrQuote(
   const { amountOut: hubEth } = await resolveEthGoldgrPath(amountIn, GOLDGR, USDT_ETH);
 
   if (isBscToken(to) && tokenKey(to) !== tokenKey(USDT_BSC)) {
-    const { path } = await resolveBestBscPath(1n, USDT_BSC.address, to.address);
+    const { path } = await resolveBestBscUsdtPath(to.address);
     const probeTxs = buildDestFillProbeTxs({
       swapId: DEST_FILL_QUOTE_SWAP_ID,
       tokenOut: to.address as Address,
@@ -302,7 +302,7 @@ async function computeQuote(
     };
   }
 
-  const { path } = await resolveBestBscPath(1n, USDT_BSC.address, to.address);
+  const { path } = await resolveBestBscUsdtPath(to.address);
   const probeTxs = buildDestFillProbeTxs({
     swapId: DEST_FILL_QUOTE_SWAP_ID,
     tokenOut: to.address as Address,

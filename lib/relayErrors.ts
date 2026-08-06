@@ -38,6 +38,19 @@ export function friendlyRelayError(input: unknown): string {
   if (/no quotes|no routes|unsupported/i.test(raw)) {
     return "No bridge route available for this pair right now. Try a different amount or token.";
   }
+  // MetaMask (and others) often pin Ethereum to a gated public RPC (e.g. Ankr) → Unauthorized /
+  // "JSON-RPC protocol is not supported" on approve while our wagmi reads still work via publicnode.
+  if (
+    /eth_getBlockByNumber:\s*Unauthorized/i.test(raw) ||
+    (/Unauthorized/i.test(raw) && /RPC 0x1|chain:\s*undefined \(id:\s*1\)|eth_getBlockByNumber/i.test(raw)) ||
+    /Version of JSON-RPC protocol is not supported/i.test(raw)
+  ) {
+    return (
+      "Your wallet's Ethereum RPC is rejecting requests. In MetaMask → Settings → Networks → " +
+      "Ethereum Mainnet, set the RPC URL to https://ethereum.publicnode.com (or another working ETH RPC), " +
+      "then retry."
+    );
+  }
   return raw || "Could not fetch a quote.";
 }
 

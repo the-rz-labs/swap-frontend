@@ -50,7 +50,7 @@ export type Token = {
  */
 export const BSC_TOKENS: Token[] = [
   { symbol: "USDT", name: "Tether USD", address: "0x55d398326f99059fF775485246999027B3197955", decimals: 18, chainId: BSC_CHAIN_ID, isHubIntermediary: true, logoURI: `${TW}/smartchain/assets/0x55d398326f99059fF775485246999027B3197955/logo.png` },
-  { symbol: "MGC", name: "MGC", address: "0xbb73BB2505AC4643d5C0a99c2A1F34B3DfD09D11", decimals: 18, chainId: BSC_CHAIN_ID },
+  { symbol: "MGC", name: "MGC", address: "0xbb73BB2505AC4643d5C0a99c2A1F34B3DfD09D11", decimals: 9, chainId: BSC_CHAIN_ID },
   { symbol: "REALESTATE", name: "Real Estate", address: "0x32477cf0e324f9a9cb49e8803fa4de9f80f8d0d4", decimals: 18, chainId: BSC_CHAIN_ID },
   { symbol: "RZ", name: "RZ", address: "0x6BC5AbCc56874D7fACb90C2c3812cc19aAf9B204", decimals: 18, chainId: BSC_CHAIN_ID },
   { symbol: "RZUSD", name: "RZ USD", address: "0xc4a1cc5ca8955a4650bdc109bddf110e33a1e344", decimals: 18, chainId: BSC_CHAIN_ID },
@@ -164,4 +164,9 @@ export function isNative(t: Token): boolean {
 
 export function tokenKey(t: Token): string {
   return `${t.chainId}:${t.address.toLowerCase()}`;
+}
+
+/** Re-resolve a token from {@link ALL_TOKENS} so decimals/metadata stay fresh (avoids stale React state). */
+export function canonicalToken(t: Token): Token {
+  return ALL_TOKENS.find((x) => tokenKey(x) === tokenKey(t)) ?? t;
 }
