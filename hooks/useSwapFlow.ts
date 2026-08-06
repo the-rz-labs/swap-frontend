@@ -1,13 +1,15 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { type Address, type WalletClient, encodePacked } from "viem";
+import { type Address, type WalletClient, encodePacked, encodeFunctionData } from "viem";
 import {
   readContract,
   writeContract,
   waitForTransactionReceipt,
   switchChain,
   getWalletClient,
+  estimateGas,
+  estimateFeesPerGas,
 } from "@wagmi/core";
 import { wagmiConfig, type AppChainId } from "@/lib/wagmi";
 import {
@@ -25,7 +27,7 @@ import { isTronAddress, tronBase58ToHex } from "@/lib/tron/tronAddress";
 import { tronAdaptedWallet } from "@/lib/tron/tronAdaptedWallet";
 import type { RelayWallet } from "@/lib/relay";
 import { ERC20_ABI } from "@/lib/rzswap";
-import { resolveBestBscPath, resolveEthGoldgrPath } from "@/lib/route";
+import { resolveBestBscPath, resolveBestBscUsdtPath, resolveEthGoldgrPath } from "@/lib/route";
 import { getRelayQuote, executeRelay, relayOutputAmount, getRelaySellDeposit, assertBridgeSizeOk } from "@/lib/relay";
 import {
   quoteRelayThenGoldgr,
@@ -44,7 +46,7 @@ import {
   RELAY_DEPOSIT_ADAPTER,
   GATEWAY_CONFIGURED,
 } from "@/lib/gateway";
-import { ETH_HUB, ETH_USDT_FILL_ADAPTER, ethHubConfigured, ethBuyFillConfigured, ethSellConfigured } from "@/lib/hub";
+import { ETH_HUB, ETH_USDT_FILL_ADAPTER, ethHubConfigured, ethBuyFillConfigured, ethSellConfigured, ethGoldgrPath } from "@/lib/hub";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
 
@@ -83,6 +85,18 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Ensures the wallet is on `chainId`, switching if necessary. */
 async function ensureChain(chainId: number) {
   await switchChain(wagmiConfig, { chainId: chainId as AppChainId });
+  // Dynamic/MetaMask can flip chainId before getWalletClient is rebound — wait briefly.
+  for (let i = 0; i < 15; i++) {
+    const client = await getWalletClient(wagmiConfig, { chainId: chainId as AppChainId });
+    if (client) {
+      try {
+        if ((await client.getChainId()) === chainId) return;
+      } catch {
+        /* retry */
+      }
+    }
+    await sleep(100);
+  }
 }
 
 /** Approves `spender` for `amount` of `token` on `chainId` if the current allowance is short. */
@@ -97,12 +111,28 @@ async function ensureAllowance(token: string, owner: Address, spender: Address, 
     chainId,
   })) as bigint;
   if (current >= amount) return;
+
+  // Prefill gas/fees via wagmi's public RPC so MetaMask doesn't need eth_estimateGas on a gated RPC.
+  const data = encodeFunctionData({
+    abi: ERC20_ABI,
+    functionName: "approve",
+    args: [spender, amount],
+  });
+  const [fees, gas] = await Promise.all([
+    estimateFeesPerGas(wagmiConfig, { chainId }),
+    estimateGas(wagmiConfig, { chainId, account: owner, to: address, data }),
+  ]);
+
   const hash = await writeContract(wagmiConfig, {
     address,
     abi: ERC20_ABI,
     functionName: "approve",
     args: [spender, amount],
     chainId,
+    account: owner,
+    gas,
+    maxFeePerGas: fees.maxFeePerGas,
+    maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
   });
   await waitForTransactionReceipt(wagmiConfig, { hash, chainId });
 }
@@ -259,7 +289,7 @@ export function useSwapFlow() {
         }
         const wallet = await sourceWallet(ctx);
 
-        const { path } = await resolveBestBscPath(1n, USDT_BSC.address, ctx.to.address);
+        const { path } = await resolveBestBscUsdtPath(ctx.to.address);
         const probeTxs = buildDestFillProbeTxs({
           swapId: ctx.swapId,
           tokenOut: ctx.to.address as `0x${string}`,
@@ -443,7 +473,7 @@ export function useSwapFlow() {
         }
         const wallet = await sourceWallet(ctx);
 
-        const { path } = await resolveEthGoldgrPath(1n, USDT_ETH, GOLDGR);
+        const path = ethGoldgrPath(USDT_ETH, GOLDGR);
         const probeTxs = buildEthDestFillProbeTxs({
           swapId: ctx.swapId,
           tokenOut: GOLDGR.address as `0x${string}`,
@@ -537,7 +567,7 @@ export function useSwapFlow() {
         let txs: ReturnType<typeof buildBuyTxs> | undefined;
 
         if (destIsBscToken) {
-          const { path: bscPath } = await resolveBestBscPath(1n, USDT_BSC.address, ctx.to.address);
+          const { path: bscPath } = await resolveBestBscUsdtPath(ctx.to.address);
           const probeTxs = buildDestFillProbeTxs({
             swapId: ctx.swapId,
             tokenOut: ctx.to.address as `0x${string}`,
@@ -628,7 +658,7 @@ export function useSwapFlow() {
         const minUsdt = applySlippage(expectedUsdt, ctx.slippageBps);
         if (minUsdt <= 0n) throw new Error("Swap quote returned zero — try a larger amount.");
 
-        const { path: ethPath } = await resolveEthGoldgrPath(1n, USDT_ETH, GOLDGR);
+        const ethPath = ethGoldgrPath(USDT_ETH, GOLDGR);
         const probeTxs = buildEthDestFillProbeTxs({
           swapId: ctx.swapId,
           tokenOut: GOLDGR.address as `0x${string}`,

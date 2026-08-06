@@ -12,10 +12,18 @@ export function safeParseUnits(value: string, decimals: number): bigint {
 
 /** Formats base units to a trimmed, fixed-precision display string. */
 export function formatAmount(value: bigint, decimals: number, maxFractionDigits = 6): string {
+  if (value === 0n) return "0";
   const full = formatUnits(value, decimals);
   const [int, frac = ""] = full.split(".");
   if (frac === "") return int;
-  const trimmed = frac.slice(0, maxFractionDigits).replace(/0+$/, "");
+  let trimmed = frac.slice(0, maxFractionDigits).replace(/0+$/, "");
+  // Non-zero amount that rounds to "0" at maxFractionDigits — widen until visible.
+  if (!trimmed && int === "0") {
+    const significant = frac.replace(/0+$/, "");
+    if (significant.length > 0) {
+      trimmed = frac.slice(0, Math.min(decimals, significant.length)).replace(/0+$/, "");
+    }
+  }
   return trimmed ? `${int}.${trimmed}` : int;
 }
 

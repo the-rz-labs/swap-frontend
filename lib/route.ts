@@ -44,6 +44,12 @@ async function quotePath(amountIn: bigint, path: Address[]): Promise<bigint | nu
 }
 
 /**
+ * 1 whole BSC-USDT. Use when we only need a viable path (dest-fill probes), not a size quote.
+ * 1 wei fails the unit-price PricingSystem (router out rounds to 0 → PricingFailed).
+ */
+export const BSC_USDT_PATH_PROBE = 10n ** 18n;
+
+/**
  * Resolves the best PancakeSwap path between two BSC tokens by quoting each candidate on-chain and
  * keeping the highest output. Throws if no candidate has liquidity.
  */
@@ -67,6 +73,11 @@ export async function resolveBestBscPath(amountIn: bigint, from: string, to: str
     );
   }
   return best;
+}
+
+/** Path discovery from BSC-USDT → tokenOut using a 1-USDT probe (not 1 wei). */
+export async function resolveBestBscUsdtPath(tokenOut: string): Promise<ResolvedRoute> {
+  return resolveBestBscPath(BSC_USDT_PATH_PROBE, USDT_BSC.address, tokenOut);
 }
 
 /**

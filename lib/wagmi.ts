@@ -1,4 +1,4 @@
-import { createConfig, http } from "wagmi";
+import { createConfig, fallback, http } from "wagmi";
 import { bsc, mainnet } from "wagmi/chains";
 
 /**
@@ -9,7 +9,15 @@ import { bsc, mainnet } from "wagmi/chains";
 export const BSC_CHAIN_ID = bsc.id; // 56
 
 const BSC_RPC = process.env.NEXT_PUBLIC_BSC_RPC || "https://bsc-dataseed.bnbchain.org";
-const ETH_RPC = process.env.NEXT_PUBLIC_ETH_RPC || "https://ethereum-rpc.publicnode.com";
+/** Primary + public fallbacks — wallet RPCs (e.g. MetaMask→Ankr) are separate and may still need a manual fix. */
+export const ETH_RPC = process.env.NEXT_PUBLIC_ETH_RPC || "https://ethereum.publicnode.com";
+const ETH_RPC_FALLBACKS = [
+  ETH_RPC,
+  "https://ethereum.publicnode.com",
+  "https://ethereum-rpc.publicnode.com",
+  "https://1rpc.io/eth",
+  "https://cloudflare-eth.com",
+].filter((u, i, a) => a.indexOf(u) === i);
 
 export const wagmiConfig = createConfig({
   chains: [bsc, mainnet],
@@ -17,7 +25,7 @@ export const wagmiConfig = createConfig({
   ssr: true,
   transports: {
     [bsc.id]: http(BSC_RPC),
-    [mainnet.id]: http(ETH_RPC),
+    [mainnet.id]: fallback(ETH_RPC_FALLBACKS.map((url) => http(url))),
   },
 });
 
