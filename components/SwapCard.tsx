@@ -23,7 +23,7 @@ import { RZSWAP_CONFIGURED } from "@/lib/rzswap";
 import { GATEWAY_CONFIGURED } from "@/lib/gateway";
 import { ethHubConfigured, ethSellConfigured } from "@/lib/hub";
 import { planSwap } from "@/lib/swapPlan";
-import { safeParseUnits, formatAmount, formatUsd, randomSwapId } from "@/lib/format";
+import { safeParseUnits, formatAmount, formatUsd } from "@/lib/format";
 import { useQuote } from "@/hooks/useQuote";
 import { useSwapFlow } from "@/hooks/useSwapFlow";
 import { useBalances } from "@/hooks/useBalances";
@@ -196,11 +196,9 @@ export function SwapCard() {
         to,
         amountIn,
         slippageBps,
-        // Buy: recipient is the destination hub address. Sell to Tron: Tron dest in destAddress.
-        address: (isBuyKind ? destRecipient : address) as `0x${string}`,
-        destAddress: tronDest && isSellKind ? destRecipient : undefined,
+        address: (destRecipient ?? address) as `0x${string}`,
+        destAddress: tronDest ? destRecipient : undefined,
         tronAddress: tronSource ? tronAddr : undefined,
-        swapId: randomSwapId(),
       });
     if (flow.status === "error") return flow.retry();
     if (flow.status === "done") {
