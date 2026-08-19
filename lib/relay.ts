@@ -155,10 +155,10 @@ function feeUsdField(fee: { amountUsd?: string } | undefined): number | undefine
 }
 
 /**
- * Bridge fee in USD from a Relay quote.
- * Prefers Relay's explicit `fees.relayer` (relayerGas + relayerService rolled up), then
- * `details.totalImpact.usd`, then currencyIn−currencyOut as a last resort.
- * Does NOT include origin wallet `fees.gas` (BNB/ETH the user pays to submit the deposit).
+ * Explicit Relay bridge/relayer fee in USD.
+ * Uses only `fees.relayer` or `relayerGas + relayerService`.
+ * Does NOT fall back to totalImpact or in−out USD (those mix price impact / swap loss
+ * into a fake "bridge fee" that looks huge on large trades).
  */
 export function relayFeeUsd(quote: Execute): number | undefined {
   const relayer = feeUsdField(quote.fees?.relayer);
@@ -168,15 +168,7 @@ export function relayFeeUsd(quote: Execute): number | undefined {
   const service = feeUsdField(quote.fees?.relayerService);
   if (gas != null || service != null) return Math.max(0, (gas ?? 0) + (service ?? 0));
 
-  const impact = quote.details?.totalImpact?.usd;
-  if (impact != null && impact !== "") {
-    const n = Math.abs(Number(impact));
-    if (Number.isFinite(n)) return n;
-  }
-
-  const { inUsd, outUsd } = relayUsd(quote);
-  if (inUsd == null || outUsd == null) return undefined;
-  return Math.max(0, inUsd - outUsd);
+  return undefined;
 }
 
 /** True once every step of an executed quote is complete. */

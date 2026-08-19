@@ -60,20 +60,20 @@ describe("relayFeeUsd", () => {
     expect(relayFeeUsd(q)).toBeCloseTo(0.05, 6);
   });
 
-  it("falls back to |totalImpact.usd|", () => {
+  it("does not treat totalImpact as a bridge fee", () => {
     const q = {
-      details: { totalImpact: { usd: "-0.042324" } },
+      details: { totalImpact: { usd: "-65.39" } },
     } as Execute;
-    expect(relayFeeUsd(q)).toBeCloseTo(0.042324, 6);
+    expect(relayFeeUsd(q)).toBeUndefined();
   });
 
-  it("falls back to inUsd − outUsd", () => {
+  it("does not treat inUsd − outUsd as a bridge fee", () => {
     const q = {
       details: {
-        currencyIn: { amountUsd: "2.09798" },
-        currencyOut: { amountUsd: "2.055656" },
+        currencyIn: { amountUsd: "26100" },
+        currencyOut: { amountUsd: "26034.61" },
       },
     } as Execute;
-    expect(relayFeeUsd(q)).toBeCloseTo(0.042324, 5);
+    expect(relayFeeUsd(q)).toBeUndefined();
   });
 });

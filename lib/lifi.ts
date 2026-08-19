@@ -30,12 +30,35 @@ export type LifiQuoteResult = {
   tx?: LifiTxRequest;
 };
 
-type LifiFeeCost = { amountUSD?: string; name?: string };
+type LifiFeeCost = {
+  amountUSD?: string;
+  name?: string;
+  included?: boolean;
+};
+
+function sumFeeUsd(fees: LifiFeeCost[] | undefined): number | undefined {
+  if (!fees?.length) return undefined;
+  let total = 0;
+  let any = false;
+  for (const f of fees) {
+    // Skip gas-like rows if LI.FI ever puts them in feeCosts.
+    const name = (f.name ?? "").toLowerCase();
+    if (name.includes("gas")) continue;
+    if (f.amountUSD == null || f.amountUSD === "") continue;
+    const n = Number(f.amountUSD);
+    if (!Number.isFinite(n) || n < 0) continue;
+    total += n;
+    any = true;
+  }
+  return any ? total : undefined;
+}
+
 type LifiEstimate = {
   toAmount?: string;
   toAmountMin?: string;
   feeCosts?: LifiFeeCost[];
 };
+
 type LifiQuoteResponse = {
   estimate?: LifiEstimate;
   transactionRequest?: {
@@ -57,20 +80,6 @@ function toLifiToken(address: string): string {
     return NATIVE_ADDRESS;
   }
   return getAddress(address as Address);
-}
-
-function sumFeeUsd(fees: LifiFeeCost[] | undefined): number | undefined {
-  if (!fees?.length) return undefined;
-  let total = 0;
-  let any = false;
-  for (const f of fees) {
-    if (f.amountUSD == null || f.amountUSD === "") continue;
-    const n = Number(f.amountUSD);
-    if (!Number.isFinite(n)) continue;
-    total += n;
-    any = true;
-  }
-  return any ? total : undefined;
 }
 
 async function lifiGet(path: string, params: Record<string, string>): Promise<LifiQuoteResponse> {
