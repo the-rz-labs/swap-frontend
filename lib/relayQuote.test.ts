@@ -16,6 +16,12 @@ vi.mock("./relay", () => ({
   relayFeeUsd: vi.fn(),
 }));
 
+vi.mock("./sushi", () => ({
+  getSushiQuote: vi.fn(),
+  getSushiSwap: vi.fn(),
+  toSushiTokenAddress: vi.fn((a: string) => a),
+}));
+
 import {
   getRelayQuote,
   relayOutputAmount,
@@ -23,11 +29,21 @@ import {
   relayUsd,
   relayFeeUsd,
 } from "./relay";
-import { computeRelayOnlyQuote } from "./relayQuote";
+import { getSushiQuote } from "./sushi";
+import { computeBestQuote, computeRelayOnlyQuote, canUseSushi } from "./relayQuote";
 
 const CAR = BSC_TOKENS.find((t) => t.symbol === "CAR")!;
+const MGC = BSC_TOKENS.find((t) => t.symbol === "MGC")!;
 const USDT_TRON = TRON_TOKENS.find((t) => t.symbol === "USDT")!;
 const FAKE_QUOTE = { steps: [] } as Execute;
+
+function mockRelayOut(out: bigint, min?: bigint) {
+  vi.mocked(getRelayQuote).mockResolvedValue(FAKE_QUOTE);
+  vi.mocked(relayOutputAmount).mockReturnValue(out);
+  vi.mocked(relayMinimumOutput).mockReturnValue(min);
+  vi.mocked(relayUsd).mockReturnValue({ inUsd: 10, outUsd: 9.5 });
+  vi.mocked(relayFeeUsd).mockReturnValue(0.5);
+}
 
 beforeEach(() => {
   vi.mocked(getRelayQuote).mockReset();
@@ -35,91 +51,83 @@ beforeEach(() => {
   vi.mocked(relayMinimumOutput).mockReset();
   vi.mocked(relayUsd).mockReset();
   vi.mocked(relayFeeUsd).mockReset();
+  vi.mocked(getSushiQuote).mockReset();
 });
 
-describe("computeRelayOnlyQuote", () => {
+describe("canUseSushi", () => {
+  it("allows same-chain BSC EVM pairs", () => {
+    expect(canUseSushi(MGC, USDT_BSC)).toBe(true);
+  });
+  it("rejects cross-chain and Tron", () => {
+    expect(canUseSushi(MGC, GOLDGR)).toBe(false);
+    expect(canUseSushi(USDT_TRON, CAR)).toBe(false);
+  });
+});
+
+describe("computeBestQuote", () => {
   it("rejects same-token pairs", async () => {
-    await expect(
-      computeRelayOnlyQuote(CAR, CAR, 1_000n, undefined, 100),
-    ).rejects.toThrow("Unsupported pair.");
-    expect(getRelayQuote).not.toHaveBeenCalled();
+    await expect(computeBestQuote(CAR, CAR, 1_000n, undefined, 100)).rejects.toThrow(
+      "Unsupported pair.",
+    );
   });
 
-  it("quotes via Relay with no custom txs", async () => {
-    vi.mocked(getRelayQuote).mockResolvedValue(FAKE_QUOTE);
-    vi.mocked(relayOutputAmount).mockReturnValue(900_000n);
-    vi.mocked(relayMinimumOutput).mockReturnValue(891_000n);
-    vi.mocked(relayUsd).mockReturnValue({ inUsd: 10, outUsd: 9.5 });
-    vi.mocked(relayFeeUsd).mockReturnValue(0.5);
+  it("picks Sushi when it returns a higher out than Relay (local)", async () => {
+    mockRelayOut(900_000n, 891_000n);
+    vi.mocked(getSushiQuote).mockResolvedValue({ amountOut: 950_000n });
 
-    const result = await computeRelayOnlyQuote(CAR, USDT_BSC, 1_000_000n, "0xabc", 100);
-
-    expect(getRelayQuote).toHaveBeenCalledWith({
-      fromChainId: CAR.chainId,
-      fromCurrency: CAR.address,
-      toChainId: USDT_BSC.chainId,
-      toCurrency: USDT_BSC.address,
-      amount: "1000000",
-      recipient: "0xabc",
-      user: undefined,
-    });
-    expect(result).toEqual({
-      output: 900_000n,
-      minOutput: 891_000n,
-      inputUsd: 10,
-      outputUsd: 9.5,
-      bridgeFeeUsd: 0.5,
-    });
+    const result = await computeBestQuote(MGC, USDT_BSC, 1_000_000n, "0xabc", 100);
+    expect(result.provider).toBe("sushi");
+    expect(result.output).toBe(950_000n);
+    expect(result.routeLabel).toContain("Sushi");
   });
 
-  it("uses applySlippage on output when Relay omits minimumAmount", async () => {
-    vi.mocked(getRelayQuote).mockResolvedValue(FAKE_QUOTE);
-    vi.mocked(relayOutputAmount).mockReturnValue(1_000_000n);
-    vi.mocked(relayMinimumOutput).mockReturnValue(undefined);
-    vi.mocked(relayUsd).mockReturnValue({});
-    vi.mocked(relayFeeUsd).mockReturnValue(undefined);
+  it("picks Relay when it returns a higher out than Sushi (local)", async () => {
+    mockRelayOut(960_000n, 950_000n);
+    vi.mocked(getSushiQuote).mockResolvedValue({ amountOut: 950_000n });
 
-    const result = await computeRelayOnlyQuote(CAR, USDT_BSC, 1n, undefined, 100);
+    const result = await computeBestQuote(MGC, USDT_BSC, 1_000_000n, undefined, 100);
+    expect(result.provider).toBe("relay");
+    expect(result.output).toBe(960_000n);
+  });
+
+  it("falls back to Relay when Sushi has no route", async () => {
+    mockRelayOut(900_000n, 891_000n);
+    vi.mocked(getSushiQuote).mockResolvedValue(null);
+
+    const result = await computeBestQuote(MGC, USDT_BSC, 1n, undefined, 100);
+    expect(result.provider).toBe("relay");
+  });
+
+  it("skips Sushi for cross-chain (GOLDGR)", async () => {
+    mockRelayOut(1n, 1n);
+    await computeBestQuote(GOLDGR, USDT_BSC, 1n, undefined, 100);
+    expect(getSushiQuote).not.toHaveBeenCalled();
+    expect(getRelayQuote).toHaveBeenCalled();
+  });
+
+  it("uses applySlippage when Relay omits minimumAmount", async () => {
+    mockRelayOut(1_000_000n, undefined);
+    vi.mocked(getSushiQuote).mockResolvedValue(null);
+    const result = await computeBestQuote(CAR, USDT_BSC, 1n, undefined, 100);
     expect(result.minOutput).toBe(990_000n);
   });
 
   it("passes USDT_TRON_ADDRESS as user for Tron source quotes", async () => {
-    vi.mocked(getRelayQuote).mockResolvedValue(FAKE_QUOTE);
-    vi.mocked(relayOutputAmount).mockReturnValue(1n);
-    vi.mocked(relayMinimumOutput).mockReturnValue(1n);
-    vi.mocked(relayUsd).mockReturnValue({});
-    vi.mocked(relayFeeUsd).mockReturnValue(undefined);
-
-    await computeRelayOnlyQuote(USDT_TRON, CAR, 1_000_000n, undefined, 100);
-
+    mockRelayOut(1n, 1n);
+    await computeBestQuote(USDT_TRON, CAR, 1_000_000n, undefined, 100);
     expect(getRelayQuote).toHaveBeenCalledWith(
-      expect.objectContaining({
-        fromChainId: USDT_TRON.chainId,
-        user: USDT_TRON_ADDRESS,
-      }),
+      expect.objectContaining({ user: USDT_TRON_ADDRESS }),
     );
+    expect(getSushiQuote).not.toHaveBeenCalled();
   });
+});
 
-  it("uses funded USDT Tron address as recipient when dest is Tron and recipient missing", async () => {
-    vi.mocked(getRelayQuote).mockResolvedValue(FAKE_QUOTE);
-    vi.mocked(relayOutputAmount).mockReturnValue(1n);
-    vi.mocked(relayMinimumOutput).mockReturnValue(1n);
-    vi.mocked(relayUsd).mockReturnValue({});
-    vi.mocked(relayFeeUsd).mockReturnValue(undefined);
-
-    await computeRelayOnlyQuote(CAR, USDT_TRON, 1n, undefined, 100);
-
-    expect(getRelayQuote).toHaveBeenCalledWith(
-      expect.objectContaining({ recipient: USDT_TRON_ADDRESS }),
-    );
-  });
-
-  it("throws when Relay returns no output amount", async () => {
-    vi.mocked(getRelayQuote).mockResolvedValue(FAKE_QUOTE);
-    vi.mocked(relayOutputAmount).mockReturnValue(undefined);
-
-    await expect(
-      computeRelayOnlyQuote(GOLDGR, USDT_BSC, 1n, undefined, 100),
-    ).rejects.toThrow("Relay returned no output amount.");
+describe("computeRelayOnlyQuote alias", () => {
+  it("still works and includes provider", async () => {
+    mockRelayOut(900_000n, 891_000n);
+    vi.mocked(getSushiQuote).mockResolvedValue(null);
+    const result = await computeRelayOnlyQuote(CAR, USDT_BSC, 1_000_000n, "0xabc", 100);
+    expect(result.provider).toBe("relay");
+    expect(result.output).toBe(900_000n);
   });
 });

@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { tokenKey, type Token } from "@/lib/tokens";
-import { computeRelayOnlyQuote, type QuoteResult } from "@/lib/relayQuote";
+import { computeBestQuote, type QuoteResult } from "@/lib/relayQuote";
 
 export type { QuoteResult };
 
@@ -22,7 +22,7 @@ export function useQuote(
       recipient ?? "anon",
       slippageBps,
     ],
-    queryFn: () => computeRelayOnlyQuote(from, to, amountIn, recipient, slippageBps),
+    queryFn: () => computeBestQuote(from, to, amountIn, recipient, slippageBps),
     enabled: amountIn > 0n && tokenKey(from) !== tokenKey(to),
     staleTime: 8_000,
     refetchInterval: 15_000,

@@ -144,7 +144,8 @@ export function SwapCard() {
   const quoteRecipient = connectedDest ?? (debouncedDestValid ? debouncedDestAddr : undefined);
   const quote = useQuote(from, to, debouncedAmountIn, quoteRecipient, slippageBps);
 
-  const routeDetail = plan.legs.map((l) => l.detail).join("  →  ") || "—";
+  const routeDetail =
+    quote.data?.routeLabel ?? (plan.legs.map((l) => l.detail).join("  →  ") || "—");
 
   const output = quote.data?.output;
   const minReceived = quote.data?.minOutput;
@@ -180,6 +181,7 @@ export function SwapCard() {
         address: (destRecipient ?? address) as `0x${string}`,
         destAddress: tronDest ? destRecipient : undefined,
         tronAddress: tronSource ? tronAddr : undefined,
+        provider: quote.data?.provider,
       });
     if (flow.status === "error") return flow.retry();
     if (flow.status === "done") {

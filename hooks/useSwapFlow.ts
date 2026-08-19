@@ -1,8 +1,8 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { type Address, type WalletClient } from "viem";
-import { switchChain, getWalletClient } from "@wagmi/core";
+import { type Address, type Hex, type WalletClient } from "viem";
+import { switchChain, getWalletClient, waitForTransactionReceipt } from "@wagmi/core";
 import { wagmiConfig, type AppChainId } from "@/lib/wagmi";
 import { USDT_TRON_ADDRESS, isTronToken, type Token } from "@/lib/tokens";
 import { isTronAddress } from "@/lib/tron/tronAddress";
@@ -11,6 +11,8 @@ import type { RelayWallet } from "@/lib/relay";
 import { getRelayQuote, executeRelay } from "@/lib/relay";
 import { isBenignRelaySolverError, friendlyRelayError } from "@/lib/relayErrors";
 import { planSwap } from "@/lib/swapPlan";
+import { ensureSushiAllowance, type QuoteProvider } from "@/lib/relayQuote";
+import { getSushiSwap } from "@/lib/sushi";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
 
@@ -37,13 +39,14 @@ export type SwapContext = {
   destAddress?: string;
   /** Connected source address on a non-EVM origin when paying from Tron. */
   tronAddress?: string;
+  /** Venue chosen at quote time (same-chain may be Sushi). Defaults to Relay. */
+  provider?: QuoteProvider;
 };
 
 type LegRunner = () => Promise<void>;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Ensures the wallet is on `chainId`, switching if necessary. */
 async function ensureChain(chainId: number) {
   await switchChain(wagmiConfig, { chainId: chainId as AppChainId });
   for (let i = 0; i < 15; i++) {
@@ -59,7 +62,6 @@ async function ensureChain(chainId: number) {
   }
 }
 
-/** Relay destination recipient — Tron uses `destAddress`; EVM uses the connected wallet. */
 function relayRecipient(ctx: SwapContext): string {
   if (isTronToken(ctx.to)) {
     if (!ctx.destAddress || !isTronAddress(ctx.destAddress)) {
@@ -70,10 +72,6 @@ function relayRecipient(ctx: SwapContext): string {
   return ctx.address;
 }
 
-/**
- * Signer for the source leg: Tron AdaptedWallet when paying from Tron, otherwise the EVM wallet
- * (after switching to the source chain).
- */
 async function sourceWallet(ctx: SwapContext): Promise<RelayWallet> {
   if (isTronToken(ctx.from)) {
     if (!ctx.tronAddress) throw new Error("Connect your Tron wallet to pay from Tron.");
@@ -84,8 +82,7 @@ async function sourceWallet(ctx: SwapContext): Promise<RelayWallet> {
 }
 
 /**
- * Drives a swap as a single Relay execute leg. Quotes and executes through Relay only — no custom
- * dest txs, no gateway writes.
+ * Drives a swap as a single leg: Relay execute, or same-chain Sushi router tx when Sushi won the quote.
  */
 export function useSwapFlow() {
   const [legs, setLegs] = useState<RunLeg[]>([]);
@@ -139,29 +136,73 @@ export function useSwapFlow() {
     [patchLeg],
   );
 
+  const makeSushiLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        if (isTronToken(ctx.from) || isTronToken(ctx.to)) {
+          throw new Error("Sushi swaps are EVM-only.");
+        }
+        if (ctx.from.chainId !== ctx.to.chainId) {
+          throw new Error("Sushi is only used for same-chain swaps.");
+        }
+        if (ctx.amountIn <= 0n) throw new Error("No input amount available for the swap.");
+
+        await ensureChain(ctx.from.chainId);
+        const wallet = (await getWalletClient(wagmiConfig, {
+          chainId: ctx.from.chainId as AppChainId,
+        })) as WalletClient;
+        if (!wallet?.account) throw new Error("Connect an EVM wallet to swap via Sushi.");
+
+        const { tx } = await getSushiSwap({
+          chainId: ctx.from.chainId,
+          tokenIn: ctx.from.address,
+          tokenOut: ctx.to.address,
+          amount: ctx.amountIn,
+          slippageBps: ctx.slippageBps,
+          sender: wallet.account.address,
+        });
+
+        await ensureSushiAllowance(wallet, ctx.from, tx.to, ctx.amountIn);
+
+        const hash = await wallet.sendTransaction({
+          account: wallet.account,
+          chain: wallet.chain,
+          to: tx.to,
+          data: tx.data as Hex,
+          value: tx.value,
+        });
+        patchLeg(legIndex, { txHash: hash, chainId: ctx.from.chainId });
+        await waitForTransactionReceipt(wagmiConfig, { hash, chainId: ctx.from.chainId as AppChainId });
+      },
+    [patchLeg],
+  );
+
   const prepare = useCallback(
     (ctx: SwapContext) => {
       const plan = planSwap(ctx.from, ctx.to);
       const runners: LegRunner[] = [];
       const legState: RunLeg[] = [];
+      const provider: QuoteProvider = ctx.provider ?? "relay";
 
       if (plan.kind === "relay" && plan.legs[0]) {
-        const leg = plan.legs[0];
+        const viaSushi = provider === "sushi";
         legState.push({
-          key: "relay",
-          label: leg.title,
+          key: viaSushi ? "sushi" : "relay",
+          label: viaSushi ? "Swap via Sushi" : plan.legs[0].title,
           status: "pending",
           chainId: ctx.from.chainId,
-          note: leg.detail,
+          note: viaSushi
+            ? `${ctx.from.symbol} → ${ctx.to.symbol} via Sushi`
+            : plan.legs[0].detail,
         });
-        runners.push(makeRelayLeg(ctx, 0));
+        runners.push(viaSushi ? makeSushiLeg(ctx, 0) : makeRelayLeg(ctx, 0));
       }
 
       runnersRef.current = runners;
       setLegs(legState);
       setCurrent(0);
     },
-    [makeRelayLeg],
+    [makeRelayLeg, makeSushiLeg],
   );
 
   const runFrom = useCallback(
