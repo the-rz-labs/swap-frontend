@@ -5,6 +5,9 @@ import {
   USDT_TRON_ADDRESS,
   isTronToken,
   NATIVE_ADDRESS,
+  BSC_CHAIN_ID,
+  ETH_CHAIN_ID,
+  TRON_CHAIN_ID,
   type Token,
 } from "./tokens";
 import { isTronAddress } from "./tron/tronAddress";
@@ -17,10 +20,12 @@ import {
 } from "./relay";
 import { classify, applySlippage } from "./swapPlan";
 import { getSushiQuote } from "./sushi";
+import { getKyberQuote } from "./kyber";
+import { getFlyQuote } from "./fly";
 import { getLifiQuote } from "./lifi";
 import { ERC20_ABI } from "./rzswap";
 
-export type QuoteProvider = "relay" | "sushi" | "lifi";
+export type QuoteProvider = "relay" | "sushi" | "kyber" | "fly" | "lifi";
 
 export type QuoteResult = {
   /** Expected final output in destination-token base units (UI "You receive"). */
@@ -40,26 +45,36 @@ export type QuoteResult = {
 };
 
 /** Placeholder EVM address for read-only LI.FI quotes when the wallet isn't connected. */
-const LIFI_QUOTE_USER = "0x1111111111111111111111111111111111111111" as Address;
+const LIFI_QUOTE_USER = "0x1111111111111111111111111111111111111111" as const;
+/** Placeholder Tron wallet for read-only LI.FI quotes (not a token contract). */
+const LIFI_TRON_QUOTE_USER = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
+
+const LIFI_CHAINS = new Set([ETH_CHAIN_ID, BSC_CHAIN_ID, TRON_CHAIN_ID]);
 
 function quoteRecipient(to: Token, recipient: string | undefined): string | undefined {
   if (!isTronToken(to)) return recipient;
   return recipient && isTronAddress(recipient) ? recipient : USDT_TRON_ADDRESS;
 }
 
-/** Same-chain EVM pairs can race Sushi. */
-export function canUseSushi(from: Token, to: Token): boolean {
+/** Same-chain EVM pairs can race local aggregators (Sushi / Kyber / Fly). */
+export function canRaceLocalAggregators(from: Token, to: Token): boolean {
   if (isTronToken(from) || isTronToken(to)) return false;
   if (from.chainId !== to.chainId) return false;
-  return from.chainId === 56 || from.chainId === 1;
+  return from.chainId === BSC_CHAIN_ID || from.chainId === ETH_CHAIN_ID;
 }
 
-/** Cross-chain EVM pairs can race LI.FI (Tron stays Relay-only). */
+/** @deprecated Prefer {@link canRaceLocalAggregators}. */
+export const canUseSushi = canRaceLocalAggregators;
+
+/** @deprecated Prefer {@link canRaceLocalAggregators}. */
+export const canUseKyber = canRaceLocalAggregators;
+
+/**
+ * Cross-chain pairs that race Relay vs LI.FI: ETH↔BSC and Tron↔EVM (1/56).
+ */
 export function canUseLifi(from: Token, to: Token): boolean {
-  if (isTronToken(from) || isTronToken(to)) return false;
   if (from.chainId === to.chainId) return false;
-  const supported = new Set([1, 56]);
-  return supported.has(from.chainId) && supported.has(to.chainId);
+  return LIFI_CHAINS.has(from.chainId) && LIFI_CHAINS.has(to.chainId);
 }
 
 function pickBest(a: QuoteResult, b: QuoteResult): QuoteResult {
@@ -122,6 +137,49 @@ async function quoteSushi(
   };
 }
 
+async function quoteKyber(
+  from: Token,
+  to: Token,
+  amountIn: bigint,
+  slippageBps: number,
+): Promise<QuoteResult | null> {
+  const q = await getKyberQuote({
+    chainId: from.chainId,
+    tokenIn: from.address,
+    tokenOut: to.address,
+    amount: amountIn,
+  });
+  if (!q) return null;
+  return {
+    output: q.amountOut,
+    minOutput: applySlippage(q.amountOut, slippageBps),
+    provider: "kyber",
+    routeLabel: `${from.symbol} → ${to.symbol} via KyberSwap`,
+  };
+}
+
+async function quoteFly(
+  from: Token,
+  to: Token,
+  amountIn: bigint,
+  slippageBps: number,
+): Promise<QuoteResult | null> {
+  const q = await getFlyQuote({
+    chainId: from.chainId,
+    tokenIn: from.address,
+    tokenOut: to.address,
+    amount: amountIn,
+    slippageBps,
+  });
+  if (!q) return null;
+  return {
+    output: q.amountOut,
+    minOutput: applySlippage(q.amountOut, slippageBps),
+    provider: "fly",
+    routeLabel: `${from.symbol} → ${to.symbol} via Fly`,
+  };
+}
+
 async function quoteLifi(
   from: Token,
   to: Token,
@@ -129,8 +187,18 @@ async function quoteLifi(
   recipient: string | undefined,
   slippageBps: number,
 ): Promise<QuoteResult | null> {
-  const toAddress =
-    recipient && /^0x[a-fA-F0-9]{40}$/.test(recipient) ? (recipient as Address) : LIFI_QUOTE_USER;
+  const fromAddress = isTronToken(from)
+    ? LIFI_TRON_QUOTE_USER
+    : LIFI_QUOTE_USER;
+
+  let toAddress: string;
+  if (isTronToken(to)) {
+    toAddress = recipient && isTronAddress(recipient) ? recipient : LIFI_TRON_QUOTE_USER;
+  } else if (recipient && /^0x[a-fA-F0-9]{40}$/.test(recipient)) {
+    toAddress = recipient;
+  } else {
+    toAddress = LIFI_QUOTE_USER;
+  }
 
   const q = await getLifiQuote({
     fromChainId: from.chainId,
@@ -139,7 +207,7 @@ async function quoteLifi(
     toToken: to.address,
     amount: amountIn,
     slippageBps,
-    fromAddress: LIFI_QUOTE_USER,
+    fromAddress,
     toAddress,
   });
   if (!q) return null;
@@ -159,9 +227,9 @@ function settledValue<T>(r: PromiseSettledResult<T | null>): T | null {
 }
 
 /**
- * Same-chain EVM: race Relay vs Sushi.
- * Cross-chain EVM: race Relay vs LI.FI.
- * Tron / unsupported: Relay only.
+ * Same-chain EVM: race Relay vs Sushi vs KyberSwap vs Fly.
+ * Cross-chain (ETH↔BSC and Tron↔EVM): race Relay vs LI.FI.
+ * Unsupported: Relay only.
  */
 export async function computeBestQuote(
   from: Token,
@@ -174,23 +242,31 @@ export async function computeBestQuote(
     throw new Error("Unsupported pair.");
   }
 
-  if (canUseSushi(from, to)) {
-    const [relaySettled, sushiSettled] = await Promise.allSettled([
+  if (canRaceLocalAggregators(from, to)) {
+    const [relaySettled, sushiSettled, kyberSettled, flySettled] = await Promise.allSettled([
       quoteRelay(from, to, amountIn, recipient, slippageBps),
       quoteSushi(from, to, amountIn, slippageBps),
+      quoteKyber(from, to, amountIn, slippageBps),
+      quoteFly(from, to, amountIn, slippageBps),
     ]);
-    const relay = settledValue(relaySettled);
-    const sushi = settledValue(sushiSettled);
-    if (relay && sushi) return pickBest(relay, sushi);
-    if (relay) return relay;
-    if (sushi) return sushi;
+    const candidates = [
+      settledValue(relaySettled),
+      settledValue(sushiSettled),
+      settledValue(kyberSettled),
+      settledValue(flySettled),
+    ].filter((q): q is QuoteResult => q != null);
+    if (candidates.length > 0) {
+      return candidates.reduce((best, next) => pickBest(best, next));
+    }
     const relayErr =
       relaySettled.status === "rejected"
         ? relaySettled.reason instanceof Error
           ? relaySettled.reason.message
           : String(relaySettled.reason)
         : "no Relay quote";
-    throw new Error(`No route available (Relay: ${relayErr}; Sushi: no route).`);
+    throw new Error(
+      `No route available (Relay: ${relayErr}; Sushi: no route; KyberSwap: no route; Fly: no route).`,
+    );
   }
 
   if (canUseLifi(from, to)) {

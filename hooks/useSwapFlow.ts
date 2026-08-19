@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { type Address, type Hex, type WalletClient } from "viem";
+import { getAddress, type Address, type Hex, type WalletClient } from "viem";
 import { switchChain, getWalletClient, waitForTransactionReceipt } from "@wagmi/core";
 import { wagmiConfig, type AppChainId } from "@/lib/wagmi";
 import { USDT_TRON_ADDRESS, isTronToken, type Token } from "@/lib/tokens";
@@ -13,7 +13,11 @@ import { isBenignRelaySolverError, friendlyRelayError } from "@/lib/relayErrors"
 import { planSwap } from "@/lib/swapPlan";
 import { ensureErc20Allowance, type QuoteProvider } from "@/lib/relayQuote";
 import { getSushiSwap } from "@/lib/sushi";
-import { getLifiSwap } from "@/lib/lifi";
+import { getKyberSwap } from "@/lib/kyber";
+import { getFlySwap } from "@/lib/fly";
+import { getLifiSwap, isLifiTronChain } from "@/lib/lifi";
+import { getTronSigner } from "@/lib/tron/tronDynamic";
+import { ensureTrc20Allowance, sendTronContractCall, waitForTronReceipt } from "@/lib/tron/tronGrid";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
 
@@ -90,6 +94,20 @@ function providerLabel(provider: QuoteProvider, from: Token, to: Token, fallback
       note: `${from.symbol} → ${to.symbol} via Sushi`,
     };
   }
+  if (provider === "kyber") {
+    return {
+      key: "kyber",
+      label: "Swap via KyberSwap",
+      note: `${from.symbol} → ${to.symbol} via KyberSwap`,
+    };
+  }
+  if (provider === "fly") {
+    return {
+      key: "fly",
+      label: "Swap via Fly",
+      note: `${from.symbol} → ${to.symbol} via Fly`,
+    };
+  }
   if (provider === "lifi") {
     return {
       key: "lifi",
@@ -101,7 +119,7 @@ function providerLabel(provider: QuoteProvider, from: Token, to: Token, fallback
 }
 
 /**
- * Single-leg swap: Relay, same-chain Sushi, or cross-chain LI.FI — whichever won the quote race.
+ * Single-leg swap: Relay, local aggregators, or cross-chain LI.FI — whichever won the quote race.
  */
 export function useSwapFlow() {
   const [legs, setLegs] = useState<RunLeg[]>([]);
@@ -196,14 +214,14 @@ export function useSwapFlow() {
     [patchLeg],
   );
 
-  const makeLifiLeg = useCallback(
+  const makeKyberLeg = useCallback(
     (ctx: SwapContext, legIndex: number): LegRunner =>
       async () => {
         if (isTronToken(ctx.from) || isTronToken(ctx.to)) {
-          throw new Error("LI.FI path is EVM-only in this app.");
+          throw new Error("KyberSwap is EVM-only.");
         }
-        if (ctx.from.chainId === ctx.to.chainId) {
-          throw new Error("LI.FI path is for cross-chain swaps.");
+        if (ctx.from.chainId !== ctx.to.chainId) {
+          throw new Error("KyberSwap is only used for same-chain swaps.");
         }
         if (ctx.amountIn <= 0n) throw new Error("No input amount available for the swap.");
 
@@ -211,9 +229,141 @@ export function useSwapFlow() {
         const wallet = (await getWalletClient(wagmiConfig, {
           chainId: ctx.from.chainId as AppChainId,
         })) as WalletClient;
+        if (!wallet?.account) throw new Error("Connect an EVM wallet to swap via KyberSwap.");
+
+        const { tx } = await getKyberSwap({
+          chainId: ctx.from.chainId,
+          tokenIn: ctx.from.address,
+          tokenOut: ctx.to.address,
+          amount: ctx.amountIn,
+          slippageBps: ctx.slippageBps,
+          sender: wallet.account.address,
+        });
+
+        await ensureErc20Allowance(wallet, ctx.from, tx.to, ctx.amountIn);
+
+        const hash = await wallet.sendTransaction({
+          account: wallet.account,
+          chain: wallet.chain,
+          to: tx.to,
+          data: tx.data as Hex,
+          value: tx.value,
+        });
+        patchLeg(legIndex, { txHash: hash, chainId: ctx.from.chainId });
+        await waitForTransactionReceipt(wagmiConfig, { hash, chainId: ctx.from.chainId as AppChainId });
+      },
+    [patchLeg],
+  );
+
+  const makeFlyLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        if (isTronToken(ctx.from) || isTronToken(ctx.to)) {
+          throw new Error("Fly is EVM-only.");
+        }
+        if (ctx.from.chainId !== ctx.to.chainId) {
+          throw new Error("Fly is only used for same-chain swaps.");
+        }
+        if (ctx.amountIn <= 0n) throw new Error("No input amount available for the swap.");
+
+        await ensureChain(ctx.from.chainId);
+        const wallet = (await getWalletClient(wagmiConfig, {
+          chainId: ctx.from.chainId as AppChainId,
+        })) as WalletClient;
+        if (!wallet?.account) throw new Error("Connect an EVM wallet to swap via Fly.");
+
+        const { tx } = await getFlySwap({
+          chainId: ctx.from.chainId,
+          tokenIn: ctx.from.address,
+          tokenOut: ctx.to.address,
+          amount: ctx.amountIn,
+          slippageBps: ctx.slippageBps,
+          sender: wallet.account.address,
+        });
+
+        await ensureErc20Allowance(wallet, ctx.from, tx.to, ctx.amountIn);
+
+        const hash = await wallet.sendTransaction({
+          account: wallet.account,
+          chain: wallet.chain,
+          to: tx.to,
+          data: tx.data as Hex,
+          value: tx.value,
+        });
+        patchLeg(legIndex, { txHash: hash, chainId: ctx.from.chainId });
+        await waitForTransactionReceipt(wagmiConfig, { hash, chainId: ctx.from.chainId as AppChainId });
+      },
+    [patchLeg],
+  );
+
+  const makeLifiLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        if (ctx.from.chainId === ctx.to.chainId) {
+          throw new Error("LI.FI path is for cross-chain swaps.");
+        }
+        if (ctx.amountIn <= 0n) throw new Error("No input amount available for the swap.");
+
+        const toAddress = isTronToken(ctx.to)
+          ? relayRecipient(ctx)
+          : ctx.address;
+
+        // --- Tron source (buy from Tron): TRC-20 approve + TriggerSmartContract ---
+        if (isTronToken(ctx.from)) {
+          if (!ctx.tronAddress || !isTronAddress(ctx.tronAddress)) {
+            throw new Error("Connect your Tron wallet to swap via LI.FI.");
+          }
+          const signer = getTronSigner();
+          if (!signer) throw new Error("No Tron wallet connected to sign the source transaction.");
+
+          const { tx, approvalAddress } = await getLifiSwap({
+            fromChainId: ctx.from.chainId,
+            toChainId: ctx.to.chainId,
+            fromToken: ctx.from.address,
+            toToken: ctx.to.address,
+            amount: ctx.amountIn,
+            slippageBps: ctx.slippageBps,
+            fromAddress: ctx.tronAddress,
+            toAddress,
+          });
+          if (!isLifiTronChain(tx.chainId) && !isTronAddress(tx.to)) {
+            throw new Error("LI.FI returned a non-Tron source transaction for a Tron sell.");
+          }
+
+          const spender = approvalAddress ?? tx.to;
+          if (spender) {
+            await ensureTrc20Allowance({
+              ownerBase58: ctx.tronAddress,
+              tokenBase58: ctx.from.address,
+              spenderBase58: spender,
+              amount: ctx.amountIn,
+              sign: (t) => signer.sign(t),
+            });
+          }
+
+          const txid = await sendTronContractCall({
+            ownerBase58: ctx.tronAddress,
+            contractBase58: tx.to,
+            data: tx.data,
+            callValue: tx.value != null && tx.value > 0n ? Number(tx.value) : 0,
+            sign: (t) => signer.sign(t),
+          });
+          patchLeg(legIndex, {
+            txHash: txid,
+            chainId: ctx.from.chainId,
+            note: "Source tx submitted — LI.FI is bridging to destination.",
+          });
+          await waitForTronReceipt(txid);
+          return;
+        }
+
+        // --- EVM source (incl. sell to Tron): approve + sendTransaction ---
+        await ensureChain(ctx.from.chainId);
+        const wallet = (await getWalletClient(wagmiConfig, {
+          chainId: ctx.from.chainId as AppChainId,
+        })) as WalletClient;
         if (!wallet?.account) throw new Error("Connect an EVM wallet to swap via LI.FI.");
 
-        const toAddress = ctx.address;
         const { tx } = await getLifiSwap({
           fromChainId: ctx.from.chainId,
           toChainId: ctx.to.chainId,
@@ -224,13 +374,17 @@ export function useSwapFlow() {
           fromAddress: wallet.account.address,
           toAddress,
         });
+        if (isTronAddress(tx.to) || isLifiTronChain(tx.chainId)) {
+          throw new Error("LI.FI returned a Tron source tx for an EVM wallet.");
+        }
 
-        await ensureErc20Allowance(wallet, ctx.from, tx.to, ctx.amountIn);
+        const spender = getAddress(tx.to as Address);
+        await ensureErc20Allowance(wallet, ctx.from, spender, ctx.amountIn);
 
         const hash = await wallet.sendTransaction({
           account: wallet.account,
           chain: wallet.chain,
-          to: tx.to,
+          to: spender,
           data: tx.data as Hex,
           value: tx.value,
         });
@@ -261,6 +415,8 @@ export function useSwapFlow() {
           note: meta.note,
         });
         if (provider === "sushi") runners.push(makeSushiLeg(ctx, 0));
+        else if (provider === "kyber") runners.push(makeKyberLeg(ctx, 0));
+        else if (provider === "fly") runners.push(makeFlyLeg(ctx, 0));
         else if (provider === "lifi") runners.push(makeLifiLeg(ctx, 0));
         else runners.push(makeRelayLeg(ctx, 0));
       }
@@ -269,7 +425,7 @@ export function useSwapFlow() {
       setLegs(legState);
       setCurrent(0);
     },
-    [makeRelayLeg, makeSushiLeg, makeLifiLeg],
+    [makeRelayLeg, makeSushiLeg, makeKyberLeg, makeFlyLeg, makeLifiLeg],
   );
 
   const runFrom = useCallback(

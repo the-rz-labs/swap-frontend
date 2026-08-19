@@ -1,10 +1,11 @@
 /**
- * LI.FI REST helpers for cross-chain (and same-chain) quotes + executable calldata.
+ * LI.FI REST helpers for cross-chain quotes + executable calldata (EVM and Tron).
  * Docs: https://docs.li.fi/api-reference/get-a-quote-for-a-token-transfer
  */
 
 import { getAddress, type Address, type Hex } from "viem";
-import { NATIVE_ADDRESS } from "./tokens";
+import { NATIVE_ADDRESS, TRON_CHAIN_ID } from "./tokens";
+import { isTronAddress } from "./tron/tronAddress";
 
 const LIFI_API = "https://li.quest/v1";
 const INTEGRATOR = process.env.NEXT_PUBLIC_LIFI_INTEGRATOR ?? "rzswap.app";
@@ -13,8 +14,9 @@ const INTEGRATOR = process.env.NEXT_PUBLIC_LIFI_INTEGRATOR ?? "rzswap.app";
 const LIFI_API_KEY = process.env.NEXT_PUBLIC_LIFI_API_KEY;
 
 export type LifiTxRequest = {
-  to: Address;
-  from?: Address;
+  /** EVM `0x…` or Tron base58 `T…`. */
+  to: string;
+  from?: string;
   data: Hex;
   value?: bigint;
   chainId?: number;
@@ -29,6 +31,8 @@ export type LifiQuoteResult = {
   /** LI.FI platform service fee (often 0.25% "LIFI Fixed Fee"). */
   serviceFeeUsd?: number;
   tool?: string;
+  /** Spender to approve on the source token (EVM or Tron address). */
+  approvalAddress?: string;
   /** Present when fromAddress was supplied — ready to send on the source chain. */
   tx?: LifiTxRequest;
 };
@@ -45,7 +49,6 @@ function sumBridgeFeeUsd(fees: LifiFeeCost[] | undefined): number | undefined {
   let any = false;
   for (const f of fees) {
     const name = (f.name ?? "").toLowerCase();
-    // LI.FI's platform take (default 0.25%) — shown separately, not as "bridge fee".
     if (name.includes("lifi fixed") || name.includes("integrator")) continue;
     if (name.includes("gas") && !name.includes("receiver")) continue;
     if (f.amountUSD == null || f.amountUSD === "") continue;
@@ -57,7 +60,6 @@ function sumBridgeFeeUsd(fees: LifiFeeCost[] | undefined): number | undefined {
   return any ? total : undefined;
 }
 
-/** LI.FI platform service fee (typically 0.25% "LIFI Fixed Fee"), if present. */
 function sumLifiServiceFeeUsd(fees: LifiFeeCost[] | undefined): number | undefined {
   if (!fees?.length) return undefined;
   let total = 0;
@@ -78,6 +80,7 @@ type LifiEstimate = {
   toAmount?: string;
   toAmountMin?: string;
   feeCosts?: LifiFeeCost[];
+  approvalAddress?: string;
 };
 
 type LifiQuoteResponse = {
@@ -95,12 +98,28 @@ type LifiQuoteResponse = {
   code?: string | number;
 };
 
-function toLifiToken(address: string): string {
+/** Pass through Tron base58; checksum EVM; map native sentinels to zero address. */
+export function toLifiToken(address: string): string {
+  if (isTronAddress(address)) return address;
   const a = address.toLowerCase();
   if (a === NATIVE_ADDRESS.toLowerCase() || a === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") {
     return NATIVE_ADDRESS;
   }
   return getAddress(address as Address);
+}
+
+function parseTxAddress(addr: string): string {
+  if (isTronAddress(addr)) return addr;
+  return getAddress(addr as Address);
+}
+
+function parseValue(value: string | undefined): bigint | undefined {
+  if (value == null || value === "") return undefined;
+  try {
+    return BigInt(value);
+  } catch {
+    return undefined;
+  }
 }
 
 async function lifiGet(path: string, params: Record<string, string>): Promise<LifiQuoteResponse> {
@@ -131,10 +150,10 @@ function parseQuote(j: LifiQuoteResponse): LifiQuoteResult | null {
   const tr = j.transactionRequest;
   if (tr?.to && tr.data) {
     tx = {
-      to: getAddress(tr.to as Address),
-      from: tr.from ? getAddress(tr.from as Address) : undefined,
+      to: parseTxAddress(tr.to),
+      from: tr.from ? parseTxAddress(tr.from) : undefined,
       data: tr.data as Hex,
-      value: tr.value != null && tr.value !== "" ? BigInt(tr.value) : undefined,
+      value: parseValue(tr.value),
       chainId: tr.chainId,
       gasLimit: tr.gasLimit,
     };
@@ -146,12 +165,13 @@ function parseQuote(j: LifiQuoteResponse): LifiQuoteResult | null {
     bridgeFeeUsd: sumBridgeFeeUsd(j.estimate?.feeCosts),
     serviceFeeUsd: sumLifiServiceFeeUsd(j.estimate?.feeCosts),
     tool: j.tool,
+    approvalAddress: j.estimate?.approvalAddress,
     tx,
   };
 }
 
 /**
- * Cross-chain (or any) quote. Pass `fromAddress`/`toAddress` to include executable calldata.
+ * Cross-chain quote (EVM↔EVM or EVM↔Tron). Pass addresses to include calldata.
  * Returns null when LI.FI has no route.
  */
 export async function getLifiQuote(input: {
@@ -184,7 +204,7 @@ export async function getLifiQuote(input: {
 }
 
 /**
- * Quote + calldata for execution. Requires a real EVM `fromAddress`.
+ * Quote + calldata for execution. `fromAddress`/`toAddress` may be EVM or Tron.
  */
 export async function getLifiSwap(input: {
   fromChainId: number;
@@ -193,9 +213,15 @@ export async function getLifiSwap(input: {
   toToken: string;
   amount: bigint;
   slippageBps: number;
-  fromAddress: Address;
-  toAddress: Address;
-}): Promise<{ amountOut: bigint; amountOutMin: bigint; tx: LifiTxRequest; bridgeFeeUsd?: number }> {
+  fromAddress: string;
+  toAddress: string;
+}): Promise<{
+  amountOut: bigint;
+  amountOutMin: bigint;
+  tx: LifiTxRequest;
+  approvalAddress?: string;
+  bridgeFeeUsd?: number;
+}> {
   const q = await getLifiQuote({
     ...input,
     fromAddress: input.fromAddress,
@@ -206,6 +232,11 @@ export async function getLifiSwap(input: {
     amountOut: q.amountOut,
     amountOutMin: q.amountOutMin,
     tx: q.tx,
+    approvalAddress: q.approvalAddress,
     bridgeFeeUsd: q.bridgeFeeUsd,
   };
+}
+
+export function isLifiTronChain(chainId: number | undefined): boolean {
+  return chainId === TRON_CHAIN_ID;
 }

@@ -95,6 +95,82 @@ export async function getTrc20Balance(ownerBase58: string, tokenBase58: string):
   return hex ? BigInt("0x" + hex) : 0n;
 }
 
+/** Read TRC-20 `allowance(owner, spender)`. */
+export async function getTrc20Allowance(
+  ownerBase58: string,
+  tokenBase58: string,
+  spenderBase58: string,
+): Promise<bigint> {
+  const ownerHex = tronBase58ToHex(ownerBase58).slice(2);
+  const tokenHex = tronBase58ToHex(tokenBase58).slice(2);
+  const spenderHex = tronBase58ToHex(spenderBase58).slice(2);
+  const parameter = "0".repeat(24) + ownerHex.slice(2) + "0".repeat(24) + spenderHex.slice(2);
+  const out = await post<{ constant_result?: string[] }>("/wallet/triggerconstantcontract", {
+    owner_address: ownerHex,
+    contract_address: tokenHex,
+    function_selector: "allowance(address,address)",
+    parameter,
+    visible: false,
+  });
+  const hex = out.constant_result?.[0];
+  return hex ? BigInt("0x" + hex) : 0n;
+}
+
+/** ABI-encode `approve(address,uint256)` for a Tron spender (base58). */
+export function encodeTrc20Approve(spenderBase58: string, amount: bigint): string {
+  const spenderHex = tronBase58ToHex(spenderBase58).slice(2); // 41 + 20 bytes
+  const addr20 = spenderHex.slice(2);
+  const amountHex = amount.toString(16).padStart(64, "0");
+  return "095ea7b3" + "0".repeat(24) + addr20 + amountHex;
+}
+
+/**
+ * Build + sign + broadcast a TriggerSmartContract call.
+ * Addresses may be base58 or `0x41…` hex; calldata may include a `0x` prefix.
+ */
+export async function sendTronContractCall(input: {
+  ownerBase58: string;
+  contractBase58: string;
+  data: string;
+  callValue?: number;
+  feeLimit?: number;
+  sign: (tx: TronTransaction) => Promise<TronTransaction>;
+}): Promise<string> {
+  const owner_address = tronBase58ToHex(input.ownerBase58).slice(2);
+  const contract_address = tronBase58ToHex(input.contractBase58).slice(2);
+  const data = input.data.startsWith("0x") ? input.data.slice(2) : input.data;
+  const unsigned = await buildTriggerTx(
+    {
+      owner_address,
+      contract_address,
+      data,
+      call_value: input.callValue ?? 0,
+    },
+    input.feeLimit ?? DEFAULT_FEE_LIMIT,
+  );
+  const signed = await input.sign(unsigned);
+  return broadcastTx(signed);
+}
+
+/** Approve `spender` for `amount` on a TRC-20 if allowance is insufficient. */
+export async function ensureTrc20Allowance(input: {
+  ownerBase58: string;
+  tokenBase58: string;
+  spenderBase58: string;
+  amount: bigint;
+  sign: (tx: TronTransaction) => Promise<TronTransaction>;
+}): Promise<void> {
+  const allowance = await getTrc20Allowance(input.ownerBase58, input.tokenBase58, input.spenderBase58);
+  if (allowance >= input.amount) return;
+  const txid = await sendTronContractCall({
+    ownerBase58: input.ownerBase58,
+    contractBase58: input.tokenBase58,
+    data: encodeTrc20Approve(input.spenderBase58, 2n ** 256n - 1n),
+    sign: input.sign,
+  });
+  await waitForTronReceipt(txid);
+}
+
 /** Poll a Tron tx until it has a result; resolves true if it executed SUCCESS. */
 export async function waitForTronReceipt(txid: string, timeoutMs = 90_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
