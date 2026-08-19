@@ -318,7 +318,7 @@ export function SwapCard() {
               </span>
             </div>
           )}
-          {quote.data?.bridgeFeeUsd != null && quote.data.bridgeFeeUsd > 0 && (
+          {isCrossChain && quote.data?.bridgeFeeUsd != null && quote.data.bridgeFeeUsd > 0 && (
             <div className="flex items-center justify-between">
               <span>Bridge fee</span>
               <span className="text-white/70">≈ {formatUsd(quote.data.bridgeFeeUsd)}</span>

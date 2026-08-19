@@ -77,7 +77,8 @@ async function quoteRelay(
     minOutput,
     inputUsd: inUsd,
     outputUsd: outUsd,
-    bridgeFeeUsd: relayFeeUsd(quote),
+    // Same-chain has no bridge — don't surface Relay's in−out gap as a "bridge fee".
+    bridgeFeeUsd: from.chainId !== to.chainId ? relayFeeUsd(quote) : undefined,
     provider: "relay",
     routeLabel: `${from.symbol} → ${to.symbol} via Relay`,
   };
