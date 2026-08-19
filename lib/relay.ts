@@ -7,64 +7,11 @@ import {
   execute as sdkExecute,
 } from "@reservoir0x/relay-sdk";
 import { bsc, mainnet, arbitrum, base, optimism, polygon } from "viem/chains";
-import { decodeFunctionData, encodeFunctionData, type WalletClient, type Hex } from "viem";
+import { type WalletClient } from "viem";
 import type { Execute, ProgressData, AdaptedWallet, RelayChain } from "@reservoir0x/relay-sdk";
 
 /** A signer Relay can execute with: an EVM viem wallet, or an adapted (e.g. Tron) wallet. */
 export type RelayWallet = WalletClient | AdaptedWallet;
-
-// RelayDepository deposit overloads. Relay's /quote returns the FIXED-amount form; we rewrite it to
-// the amount-less form so the adapter deposits its FULL balance (the entire swap output) — bridging
-// everything instead of a pre-quoted minimum and refunding the slippage drift to the user.
-const DEPOSIT_ERC20_FIXED = [
-  {
-    type: "function",
-    name: "depositErc20",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "depositor", type: "address" },
-      { name: "token", type: "address" },
-      { name: "amount", type: "uint256" },
-      { name: "id", type: "bytes32" },
-    ],
-    outputs: [],
-  },
-] as const;
-const DEPOSIT_ERC20_FULL = [
-  {
-    type: "function",
-    name: "depositErc20",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "depositor", type: "address" },
-      { name: "token", type: "address" },
-      { name: "id", type: "bytes32" },
-    ],
-    outputs: [],
-  },
-] as const;
-
-/**
- * Rewrite Relay's fixed-amount depositErc20(depositor, token, amount, id) into the amount-less
- * depositErc20(depositor, token, id), which deposits the caller's FULL approval. The adapter approves
- * the depository for the entire swap output, so this forwards 100% of the output to Relay with no
- * drift refund. The `id` is the order id (does not encode the amount). If Relay ever returns a
- * different deposit shape, we leave the calldata untouched (safe fallback to the quoted behavior).
- */
-function toFullBalanceDeposit(calldata: Hex): Hex {
-  try {
-    const { functionName, args } = decodeFunctionData({ abi: DEPOSIT_ERC20_FIXED, data: calldata });
-    if (functionName !== "depositErc20") return calldata;
-    const [depositor, token, , id] = args as [string, string, bigint, Hex];
-    return encodeFunctionData({
-      abi: DEPOSIT_ERC20_FULL,
-      functionName: "depositErc20",
-      args: [depositor as `0x${string}`, token as `0x${string}`, id],
-    });
-  } catch {
-    return calldata; // not the expected shape — keep Relay's calldata as-is
-  }
-}
 
 let initialized = false;
 
@@ -230,84 +177,6 @@ export function relayFeeUsd(quote: Execute): number | undefined {
   const { inUsd, outUsd } = relayUsd(quote);
   if (inUsd == null || outUsd == null) return undefined;
   return Math.max(0, inUsd - outUsd);
-}
-
-/**
- * SELL helper: quotes a USDT-out bridge whose ON-CHAIN depositor is `depositor` (our
- * RelayDepositAdapter), and returns the depository call to execute. The adapter runs this calldata
- * after the RzSwap swap, so the sell is one approve + one call. Uses the raw API (not the SDK) so we
- * can set `user` to a contract.
- *
- * The returned calldata is rewritten to the amount-less depositErc20 so the adapter deposits its FULL
- * balance (the entire swap output) — the whole output is bridged to Relay, with no drift refunded to
- * the user. `amount` is still sent to /quote so Relay can price the destination output; the on-chain
- * deposit amount is the adapter's actual balance, which the Relay allocator credits via the deposit
- * event. (`amount` = the swap's expected output so the destination estimate matches what's bridged.)
- */
-export type RelaySellDeposit = { depository: `0x${string}`; data: `0x${string}`; value: string };
-
-export async function getRelaySellDeposit(input: {
-  depositor: string;
-  /**
-   * Origin-chain address that receives Relay's async refund if the destination fill fails.
-   * MUST be the end user — never the adapter. `user` stays the adapter (on-chain depositor);
-   * without `refundTo`, refunds land on the adapter and get stuck.
-   */
-  refundTo: string;
-  recipient: string;
-  originCurrency: string; // USDT on the origin hub
-  amount: string; // base units used for the destination quote (swap's expected output)
-  toChainId: number;
-  toCurrency: string;
-  /** Origin chain of the adapter deposit (default BSC 56; pass 1 for ETH GOLDGR sells). */
-  originChainId?: number;
-  /** Destination-chain calls (e.g. fulfillBuy on the other hub). */
-  txs?: RelayCallTx[];
-  /** Prefer origin-chain refund on dest failure (default true). */
-  refundOnOrigin?: boolean;
-}): Promise<RelaySellDeposit> {
-  const body: Record<string, unknown> = {
-    user: input.depositor,
-    refundTo: input.refundTo,
-    recipient: input.recipient,
-    originChainId: input.originChainId ?? 56,
-    destinationChainId: input.toChainId,
-    originCurrency: input.originCurrency,
-    destinationCurrency: input.toCurrency,
-    amount: input.amount,
-    tradeType: "EXACT_INPUT",
-    options: { refundOnOrigin: input.refundOnOrigin ?? true },
-  };
-  if (input.txs?.length) body.txs = input.txs;
-
-  const res = await fetch("https://api.relay.link/quote", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const j = await res.json();
-  if (!res.ok || j?.message) throw new Error(`Relay sell quote failed: ${j?.message ?? res.status}`);
-  const dep = (j.steps ?? []).find((s: { id?: string }) => s.id === "deposit");
-  const item = dep?.items?.[0]?.data;
-  if (!item?.to || !item?.data) throw new Error("Relay returned no deposit step for the sell.");
-  return { depository: item.to, data: toFullBalanceDeposit(item.data as Hex), value: item.value ?? "0" };
-}
-
-/**
- * Reject dust sells where Relay's fixed fees would dominate — those fills often revert on dest
- * `minOut` and force an origin USDT refund (original token already swapped).
- */
-export function assertBridgeSizeOk(quote: Execute, label = "swap"): void {
-  const { inUsd, outUsd } = relayUsd(quote);
-  const fee = relayFeeUsd(quote);
-  if (outUsd != null && outUsd < 2) {
-    throw new Error(`Amount too small for a cross-chain ${label} — try at least ~$2 after bridge fees.`);
-  }
-  if (inUsd != null && fee != null && inUsd > 0 && fee / inUsd > 0.2) {
-    throw new Error(
-      `Bridge fees are too high for this size (~${Math.round((fee / inUsd) * 100)}% of input). Try a larger amount.`,
-    );
-  }
 }
 
 /** True once every step of an executed quote is complete. */

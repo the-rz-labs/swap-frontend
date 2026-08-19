@@ -19,9 +19,6 @@ import {
 import { isTronAddress } from "@/lib/tron/tronAddress";
 import { setTronSigner, tronSignerFromWallet } from "@/lib/tron/tronDynamic";
 import { friendlyRelayError, isAmountTooSmallError } from "@/lib/relayErrors";
-import { RZSWAP_CONFIGURED } from "@/lib/rzswap";
-import { GATEWAY_CONFIGURED } from "@/lib/gateway";
-import { ethHubConfigured, ethSellConfigured } from "@/lib/hub";
 import { planSwap } from "@/lib/swapPlan";
 import { safeParseUnits, formatAmount, formatUsd } from "@/lib/format";
 import { useQuote } from "@/hooks/useQuote";
@@ -127,12 +124,7 @@ export function SwapCard() {
   const debouncedAmountIn = useDebounced(amountIn, 400);
 
   const plan = useMemo(() => planSwap(from, to), [from, to]);
-  const isCrossChain =
-    plan.kind === "inbound" ||
-    plan.kind === "outbound" ||
-    plan.kind === "buy-goldgr" ||
-    plan.kind === "sell-goldgr" ||
-    plan.kind === "bsc-to-goldgr";
+  const isCrossChain = from.chainId !== to.chainId;
 
   // Destination recipient: the wallet auto-available on the destination chain (the Tron wallet for a
   // Tron destination, the EVM wallet otherwise), or a manually pasted address validated for that chain.
@@ -172,25 +164,14 @@ export function SwapCard() {
     flow.reset();
   }
 
-  const rzswapNeeded = plan.legs.some((l) => l.kind === "rzswap") || (plan.kind === "inbound" && !plan.hubIsEndpoint);
-  const goldgrRoute = involvesGoldgr(from, to);
-  const blockedByConfig = goldgrRoute
-    ? !ethHubConfigured() ||
-      (plan.kind === "sell-goldgr" && !ethSellConfigured()) ||
-      (plan.kind === "bsc-to-goldgr" && !GATEWAY_CONFIGURED)
-    : rzswapNeeded && !RZSWAP_CONFIGURED;
   const insufficient = fromBal != null && amountIn > fromBal;
 
   const canStart =
-    sourceReady && destOk && plan.kind !== "invalid" && amountIn > 0n && !blockedByConfig && !insufficient && !quote.isError;
-
-  const isBuyKind = plan.kind === "inbound" || plan.kind === "buy-goldgr";
-  const isSellKind = plan.kind === "outbound" || plan.kind === "sell-goldgr";
+    sourceReady && destOk && plan.kind !== "invalid" && amountIn > 0n && !insufficient && !quote.isError;
 
   function mainAction() {
     if (!sourceReady) return setShowAuthFlow(true);
     if (flow.status === "idle")
-      // swapId ideally comes from the backend; a client-side random id is used as a fallback.
       return flow.start({
         from,
         to,
@@ -209,11 +190,6 @@ export function SwapCard() {
 
   const buttonLabel = (() => {
     if (!sourceReady) return tronSource ? "Connect Tron wallet" : "Connect Wallet";
-    if (blockedByConfig) {
-      if (goldgrRoute && plan.kind === "sell-goldgr" && !ethSellConfigured()) return "ETH Relay depository not set";
-      if (goldgrRoute) return "ETH GOLDGR hub not configured";
-      return "RzSwap not configured";
-    }
     if (plan.kind === "invalid") return plan.error ?? "Invalid pair";
     if (amountIn === 0n) return "Enter an amount";
     if (insufficient) return `Insufficient ${from.symbol}`;
@@ -382,19 +358,10 @@ export function SwapCard() {
       {flow.status === "running" && flow.legs.length > 1 && (
         <p className="mt-2 text-center text-xs text-muted">Approve each wallet prompt as it appears — steps run automatically.</p>
       )}
-      {flow.status === "idle" && amountIn > 0n && plan.kind === "inbound" && !plan.hubIsEndpoint && (
+      {flow.status === "idle" && amountIn > 0n && isCrossChain && (
         <p className="mt-2 text-center text-xs text-muted">
-          One signature: Relay bridges to USDT and swaps it into {to.symbol} on BNB Chain (USDT back if it can&apos;t fill).
-        </p>
-      )}
-      {flow.status === "idle" && amountIn > 0n && plan.kind === "buy-goldgr" && (
-        <p className="mt-2 text-center text-xs text-muted">
-          One signature: Relay bridges to USDT on Ethereum and swaps it into GOLDGR.
-        </p>
-      )}
-      {flow.status === "idle" && amountIn > 0n && plan.kind === "bsc-to-goldgr" && (
-        <p className="mt-2 text-center text-xs text-muted">
-          One signature on BNB Chain: sell to USDT, bridge to Ethereum, and buy GOLDGR — no Ethereum wallet prompt.
+          One signature on {CHAIN_NAMES[from.chainId] ?? "source"}: Relay bridges and swaps into {to.symbol} on{" "}
+          {CHAIN_NAMES[to.chainId] ?? "destination"}.
         </p>
       )}
 
