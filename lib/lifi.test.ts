@@ -14,7 +14,10 @@ describe("getLifiQuote", () => {
         estimate: {
           toAmount: "1000000",
           toAmountMin: "990000",
-          feeCosts: [{ amountUSD: "0.25" }, { amountUSD: "0.10" }],
+          feeCosts: [
+            { name: "LIFI Fixed Fee", amountUSD: "0.25", included: true },
+            { name: "Gas receiver fee", amountUSD: "0.10", included: false },
+          ],
         },
         transactionRequest: {
           to: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",
@@ -39,7 +42,8 @@ describe("getLifiQuote", () => {
     expect(q).toEqual({
       amountOut: 1_000_000n,
       amountOutMin: 990_000n,
-      bridgeFeeUsd: 0.35,
+      bridgeFeeUsd: 0.1,
+      serviceFeeUsd: 0.25,
       tool: "stargate",
       tx: expect.objectContaining({
         to: "0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE",

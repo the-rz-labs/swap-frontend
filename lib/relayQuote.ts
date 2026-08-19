@@ -29,7 +29,10 @@ export type QuoteResult = {
   minOutput: bigint;
   inputUsd?: number;
   outputUsd?: number;
+  /** Bridge / relayer fee (not price impact, not LI.FI platform take). */
   bridgeFeeUsd?: number;
+  /** LI.FI platform service fee (~0.25%), when that venue won. */
+  serviceFeeUsd?: number;
   /** Winning venue. */
   provider: QuoteProvider;
   /** Short route label for the UI. */
@@ -144,6 +147,7 @@ async function quoteLifi(
     output: q.amountOut,
     minOutput: q.amountOutMin > 0n ? q.amountOutMin : applySlippage(q.amountOut, slippageBps),
     bridgeFeeUsd: q.bridgeFeeUsd,
+    serviceFeeUsd: q.serviceFeeUsd,
     provider: "lifi",
     routeLabel: `${from.symbol} → ${to.symbol} via LI.FI${q.tool ? ` (${q.tool})` : ""}`,
   };

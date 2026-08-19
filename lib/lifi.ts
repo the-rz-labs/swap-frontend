@@ -24,7 +24,10 @@ export type LifiTxRequest = {
 export type LifiQuoteResult = {
   amountOut: bigint;
   amountOutMin: bigint;
+  /** Bridge / gas-receiver style fees (excludes LI.FI's 0.25% platform fee). */
   bridgeFeeUsd?: number;
+  /** LI.FI platform service fee (often 0.25% "LIFI Fixed Fee"). */
+  serviceFeeUsd?: number;
   tool?: string;
   /** Present when fromAddress was supplied — ready to send on the source chain. */
   tx?: LifiTxRequest;
@@ -36,14 +39,32 @@ type LifiFeeCost = {
   included?: boolean;
 };
 
-function sumFeeUsd(fees: LifiFeeCost[] | undefined): number | undefined {
+function sumBridgeFeeUsd(fees: LifiFeeCost[] | undefined): number | undefined {
   if (!fees?.length) return undefined;
   let total = 0;
   let any = false;
   for (const f of fees) {
-    // Skip gas-like rows if LI.FI ever puts them in feeCosts.
     const name = (f.name ?? "").toLowerCase();
-    if (name.includes("gas")) continue;
+    // LI.FI's platform take (default 0.25%) — shown separately, not as "bridge fee".
+    if (name.includes("lifi fixed") || name.includes("integrator")) continue;
+    if (name.includes("gas") && !name.includes("receiver")) continue;
+    if (f.amountUSD == null || f.amountUSD === "") continue;
+    const n = Number(f.amountUSD);
+    if (!Number.isFinite(n) || n < 0) continue;
+    total += n;
+    any = true;
+  }
+  return any ? total : undefined;
+}
+
+/** LI.FI platform service fee (typically 0.25% "LIFI Fixed Fee"), if present. */
+function sumLifiServiceFeeUsd(fees: LifiFeeCost[] | undefined): number | undefined {
+  if (!fees?.length) return undefined;
+  let total = 0;
+  let any = false;
+  for (const f of fees) {
+    const name = (f.name ?? "").toLowerCase();
+    if (!(name.includes("lifi fixed") || name.includes("integrator"))) continue;
     if (f.amountUSD == null || f.amountUSD === "") continue;
     const n = Number(f.amountUSD);
     if (!Number.isFinite(n) || n < 0) continue;
@@ -122,7 +143,8 @@ function parseQuote(j: LifiQuoteResponse): LifiQuoteResult | null {
   return {
     amountOut,
     amountOutMin,
-    bridgeFeeUsd: sumFeeUsd(j.estimate?.feeCosts),
+    bridgeFeeUsd: sumBridgeFeeUsd(j.estimate?.feeCosts),
+    serviceFeeUsd: sumLifiServiceFeeUsd(j.estimate?.feeCosts),
     tool: j.tool,
     tx,
   };

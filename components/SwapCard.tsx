@@ -324,6 +324,14 @@ export function SwapCard() {
               <span className="text-white/70">≈ {formatUsd(quote.data.bridgeFeeUsd)}</span>
             </div>
           )}
+          {quote.data?.provider === "lifi" &&
+            quote.data.serviceFeeUsd != null &&
+            quote.data.serviceFeeUsd > 0 && (
+              <div className="flex items-center justify-between">
+                <span>LI.FI fee (0.25%)</span>
+                <span className="text-white/70">≈ {formatUsd(quote.data.serviceFeeUsd)}</span>
+              </div>
+            )}
           <div className="flex items-center justify-between">
             <span>Max slippage</span>
             <span className="flex gap-1">
