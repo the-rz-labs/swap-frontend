@@ -11,8 +11,9 @@ import type { RelayWallet } from "@/lib/relay";
 import { getRelayQuote, executeRelay } from "@/lib/relay";
 import { isBenignRelaySolverError, friendlyRelayError } from "@/lib/relayErrors";
 import { planSwap } from "@/lib/swapPlan";
-import { ensureSushiAllowance, type QuoteProvider } from "@/lib/relayQuote";
+import { ensureErc20Allowance, type QuoteProvider } from "@/lib/relayQuote";
 import { getSushiSwap } from "@/lib/sushi";
+import { getLifiSwap } from "@/lib/lifi";
 
 export type LegStatus = "pending" | "active" | "done" | "error";
 
@@ -33,13 +34,9 @@ export type SwapContext = {
   to: Token;
   amountIn: bigint;
   slippageBps: number;
-  /** Connected EVM wallet (source refunds, EVM destinations). */
   address: Address;
-  /** Destination address on a non-EVM target chain (e.g. base58 Tron) when `to` is non-EVM. */
   destAddress?: string;
-  /** Connected source address on a non-EVM origin when paying from Tron. */
   tronAddress?: string;
-  /** Venue chosen at quote time (same-chain may be Sushi). Defaults to Relay. */
   provider?: QuoteProvider;
 };
 
@@ -81,8 +78,30 @@ async function sourceWallet(ctx: SwapContext): Promise<RelayWallet> {
   return (await getWalletClient(wagmiConfig, { chainId: ctx.from.chainId as AppChainId })) as WalletClient;
 }
 
+function providerLabel(provider: QuoteProvider, from: Token, to: Token, fallbackDetail: string): {
+  key: string;
+  label: string;
+  note: string;
+} {
+  if (provider === "sushi") {
+    return {
+      key: "sushi",
+      label: "Swap via Sushi",
+      note: `${from.symbol} → ${to.symbol} via Sushi`,
+    };
+  }
+  if (provider === "lifi") {
+    return {
+      key: "lifi",
+      label: "Bridge via LI.FI",
+      note: `${from.symbol} → ${to.symbol} via LI.FI`,
+    };
+  }
+  return { key: "relay", label: "Swap via Relay", note: fallbackDetail };
+}
+
 /**
- * Drives a swap as a single leg: Relay execute, or same-chain Sushi router tx when Sushi won the quote.
+ * Single-leg swap: Relay, same-chain Sushi, or cross-chain LI.FI — whichever won the quote race.
  */
 export function useSwapFlow() {
   const [legs, setLegs] = useState<RunLeg[]>([]);
@@ -162,7 +181,7 @@ export function useSwapFlow() {
           sender: wallet.account.address,
         });
 
-        await ensureSushiAllowance(wallet, ctx.from, tx.to, ctx.amountIn);
+        await ensureErc20Allowance(wallet, ctx.from, tx.to, ctx.amountIn);
 
         const hash = await wallet.sendTransaction({
           account: wallet.account,
@@ -177,6 +196,54 @@ export function useSwapFlow() {
     [patchLeg],
   );
 
+  const makeLifiLeg = useCallback(
+    (ctx: SwapContext, legIndex: number): LegRunner =>
+      async () => {
+        if (isTronToken(ctx.from) || isTronToken(ctx.to)) {
+          throw new Error("LI.FI path is EVM-only in this app.");
+        }
+        if (ctx.from.chainId === ctx.to.chainId) {
+          throw new Error("LI.FI path is for cross-chain swaps.");
+        }
+        if (ctx.amountIn <= 0n) throw new Error("No input amount available for the swap.");
+
+        await ensureChain(ctx.from.chainId);
+        const wallet = (await getWalletClient(wagmiConfig, {
+          chainId: ctx.from.chainId as AppChainId,
+        })) as WalletClient;
+        if (!wallet?.account) throw new Error("Connect an EVM wallet to swap via LI.FI.");
+
+        const toAddress = ctx.address;
+        const { tx } = await getLifiSwap({
+          fromChainId: ctx.from.chainId,
+          toChainId: ctx.to.chainId,
+          fromToken: ctx.from.address,
+          toToken: ctx.to.address,
+          amount: ctx.amountIn,
+          slippageBps: ctx.slippageBps,
+          fromAddress: wallet.account.address,
+          toAddress,
+        });
+
+        await ensureErc20Allowance(wallet, ctx.from, tx.to, ctx.amountIn);
+
+        const hash = await wallet.sendTransaction({
+          account: wallet.account,
+          chain: wallet.chain,
+          to: tx.to,
+          data: tx.data as Hex,
+          value: tx.value,
+        });
+        patchLeg(legIndex, {
+          txHash: hash,
+          chainId: ctx.from.chainId,
+          note: "Source tx submitted — LI.FI is bridging to destination.",
+        });
+        await waitForTransactionReceipt(wagmiConfig, { hash, chainId: ctx.from.chainId as AppChainId });
+      },
+    [patchLeg],
+  );
+
   const prepare = useCallback(
     (ctx: SwapContext) => {
       const plan = planSwap(ctx.from, ctx.to);
@@ -185,24 +252,24 @@ export function useSwapFlow() {
       const provider: QuoteProvider = ctx.provider ?? "relay";
 
       if (plan.kind === "relay" && plan.legs[0]) {
-        const viaSushi = provider === "sushi";
+        const meta = providerLabel(provider, ctx.from, ctx.to, plan.legs[0].detail);
         legState.push({
-          key: viaSushi ? "sushi" : "relay",
-          label: viaSushi ? "Swap via Sushi" : plan.legs[0].title,
+          key: meta.key,
+          label: meta.label,
           status: "pending",
           chainId: ctx.from.chainId,
-          note: viaSushi
-            ? `${ctx.from.symbol} → ${ctx.to.symbol} via Sushi`
-            : plan.legs[0].detail,
+          note: meta.note,
         });
-        runners.push(viaSushi ? makeSushiLeg(ctx, 0) : makeRelayLeg(ctx, 0));
+        if (provider === "sushi") runners.push(makeSushiLeg(ctx, 0));
+        else if (provider === "lifi") runners.push(makeLifiLeg(ctx, 0));
+        else runners.push(makeRelayLeg(ctx, 0));
       }
 
       runnersRef.current = runners;
       setLegs(legState);
       setCurrent(0);
     },
-    [makeRelayLeg, makeSushiLeg],
+    [makeRelayLeg, makeSushiLeg, makeLifiLeg],
   );
 
   const runFrom = useCallback(

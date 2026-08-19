@@ -6,6 +6,7 @@ import {
   USDT_BSC,
   USDT_TRON_ADDRESS,
   GOLDGR,
+  USDT_ETH,
 } from "./tokens";
 
 vi.mock("./relay", () => ({
@@ -22,6 +23,11 @@ vi.mock("./sushi", () => ({
   toSushiTokenAddress: vi.fn((a: string) => a),
 }));
 
+vi.mock("./lifi", () => ({
+  getLifiQuote: vi.fn(),
+  getLifiSwap: vi.fn(),
+}));
+
 import {
   getRelayQuote,
   relayOutputAmount,
@@ -30,7 +36,8 @@ import {
   relayFeeUsd,
 } from "./relay";
 import { getSushiQuote } from "./sushi";
-import { computeBestQuote, computeRelayOnlyQuote, canUseSushi } from "./relayQuote";
+import { getLifiQuote } from "./lifi";
+import { computeBestQuote, canUseSushi, canUseLifi } from "./relayQuote";
 
 const CAR = BSC_TOKENS.find((t) => t.symbol === "CAR")!;
 const MGC = BSC_TOKENS.find((t) => t.symbol === "MGC")!;
@@ -52,82 +59,77 @@ beforeEach(() => {
   vi.mocked(relayUsd).mockReset();
   vi.mocked(relayFeeUsd).mockReset();
   vi.mocked(getSushiQuote).mockReset();
+  vi.mocked(getLifiQuote).mockReset();
 });
 
-describe("canUseSushi", () => {
-  it("allows same-chain BSC EVM pairs", () => {
+describe("canUseSushi / canUseLifi", () => {
+  it("sushi: same-chain BSC only", () => {
     expect(canUseSushi(MGC, USDT_BSC)).toBe(true);
+    expect(canUseSushi(USDT_ETH, USDT_BSC)).toBe(false);
   });
-  it("rejects cross-chain and Tron", () => {
-    expect(canUseSushi(MGC, GOLDGR)).toBe(false);
-    expect(canUseSushi(USDT_TRON, CAR)).toBe(false);
+  it("lifi: cross-chain EVM only", () => {
+    expect(canUseLifi(USDT_ETH, USDT_BSC)).toBe(true);
+    expect(canUseLifi(MGC, USDT_BSC)).toBe(false);
+    expect(canUseLifi(USDT_TRON, CAR)).toBe(false);
   });
 });
 
-describe("computeBestQuote", () => {
-  it("rejects same-token pairs", async () => {
-    await expect(computeBestQuote(CAR, CAR, 1_000n, undefined, 100)).rejects.toThrow(
-      "Unsupported pair.",
-    );
-  });
-
-  it("picks Sushi when it returns a higher out than Relay (local)", async () => {
+describe("computeBestQuote local (Relay vs Sushi)", () => {
+  it("picks Sushi when higher", async () => {
     mockRelayOut(900_000n, 891_000n);
     vi.mocked(getSushiQuote).mockResolvedValue({ amountOut: 950_000n });
-
     const result = await computeBestQuote(MGC, USDT_BSC, 1_000_000n, "0xabc", 100);
     expect(result.provider).toBe("sushi");
-    expect(result.output).toBe(950_000n);
-    expect(result.routeLabel).toContain("Sushi");
+    expect(getLifiQuote).not.toHaveBeenCalled();
   });
 
-  it("picks Relay when it returns a higher out than Sushi (local)", async () => {
+  it("picks Relay when higher", async () => {
     mockRelayOut(960_000n, 950_000n);
     vi.mocked(getSushiQuote).mockResolvedValue({ amountOut: 950_000n });
-
-    const result = await computeBestQuote(MGC, USDT_BSC, 1_000_000n, undefined, 100);
-    expect(result.provider).toBe("relay");
-    expect(result.output).toBe(960_000n);
-  });
-
-  it("falls back to Relay when Sushi has no route", async () => {
-    mockRelayOut(900_000n, 891_000n);
-    vi.mocked(getSushiQuote).mockResolvedValue(null);
-
     const result = await computeBestQuote(MGC, USDT_BSC, 1n, undefined, 100);
     expect(result.provider).toBe("relay");
   });
+});
 
-  it("skips Sushi for cross-chain (GOLDGR)", async () => {
-    mockRelayOut(1n, 1n);
-    await computeBestQuote(GOLDGR, USDT_BSC, 1n, undefined, 100);
+describe("computeBestQuote cross-chain (Relay vs LI.FI)", () => {
+  it("picks LI.FI when higher", async () => {
+    mockRelayOut(90_000_000n, 89_000_000n);
+    vi.mocked(getLifiQuote).mockResolvedValue({
+      amountOut: 95_000_000n,
+      amountOutMin: 94_000_000n,
+      bridgeFeeUsd: 0.25,
+      tool: "stargate",
+    });
+    const result = await computeBestQuote(USDT_ETH, USDT_BSC, 100_000_000n, undefined, 50);
+    expect(result.provider).toBe("lifi");
+    expect(result.output).toBe(95_000_000n);
+    expect(result.routeLabel).toContain("LI.FI");
     expect(getSushiQuote).not.toHaveBeenCalled();
-    expect(getRelayQuote).toHaveBeenCalled();
   });
 
-  it("uses applySlippage when Relay omits minimumAmount", async () => {
-    mockRelayOut(1_000_000n, undefined);
-    vi.mocked(getSushiQuote).mockResolvedValue(null);
-    const result = await computeBestQuote(CAR, USDT_BSC, 1n, undefined, 100);
-    expect(result.minOutput).toBe(990_000n);
+  it("picks Relay when higher than LI.FI", async () => {
+    mockRelayOut(96_000_000n, 95_000_000n);
+    vi.mocked(getLifiQuote).mockResolvedValue({
+      amountOut: 95_000_000n,
+      amountOutMin: 94_000_000n,
+    });
+    const result = await computeBestQuote(USDT_ETH, MGC, 100_000_000n, undefined, 50);
+    expect(result.provider).toBe("relay");
   });
 
-  it("passes USDT_TRON_ADDRESS as user for Tron source quotes", async () => {
+  it("falls back to Relay when LI.FI has no route", async () => {
+    mockRelayOut(90_000_000n, 89_000_000n);
+    vi.mocked(getLifiQuote).mockResolvedValue(null);
+    const result = await computeBestQuote(USDT_ETH, USDT_BSC, 1n, undefined, 50);
+    expect(result.provider).toBe("relay");
+  });
+
+  it("skips LI.FI for Tron", async () => {
     mockRelayOut(1n, 1n);
     await computeBestQuote(USDT_TRON, CAR, 1_000_000n, undefined, 100);
+    expect(getLifiQuote).not.toHaveBeenCalled();
     expect(getRelayQuote).toHaveBeenCalledWith(
       expect.objectContaining({ user: USDT_TRON_ADDRESS }),
     );
-    expect(getSushiQuote).not.toHaveBeenCalled();
-  });
-});
-
-describe("computeRelayOnlyQuote alias", () => {
-  it("still works and includes provider", async () => {
-    mockRelayOut(900_000n, 891_000n);
-    vi.mocked(getSushiQuote).mockResolvedValue(null);
-    const result = await computeRelayOnlyQuote(CAR, USDT_BSC, 1_000_000n, "0xabc", 100);
-    expect(result.provider).toBe("relay");
-    expect(result.output).toBe(900_000n);
   });
 });

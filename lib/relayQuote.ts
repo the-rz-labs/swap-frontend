@@ -17,36 +17,50 @@ import {
 } from "./relay";
 import { classify, applySlippage } from "./swapPlan";
 import { getSushiQuote } from "./sushi";
+import { getLifiQuote } from "./lifi";
 import { ERC20_ABI } from "./rzswap";
 
-
-export type QuoteProvider = "relay" | "sushi";
+export type QuoteProvider = "relay" | "sushi" | "lifi";
 
 export type QuoteResult = {
   /** Expected final output in destination-token base units (UI "You receive"). */
   output: bigint;
-  /** Guaranteed floor: Relay minimum when present, else output × (1 − slippage). */
+  /** Guaranteed floor: venue minimum when present, else output × (1 − slippage). */
   minOutput: bigint;
   inputUsd?: number;
   outputUsd?: number;
   bridgeFeeUsd?: number;
-  /** Which venue won (local races Relay vs Sushi; cross-chain is always Relay). */
+  /** Winning venue. */
   provider: QuoteProvider;
   /** Short route label for the UI. */
   routeLabel: string;
 };
+
+/** Placeholder EVM address for read-only LI.FI quotes when the wallet isn't connected. */
+const LIFI_QUOTE_USER = "0x1111111111111111111111111111111111111111" as Address;
 
 function quoteRecipient(to: Token, recipient: string | undefined): string | undefined {
   if (!isTronToken(to)) return recipient;
   return recipient && isTronAddress(recipient) ? recipient : USDT_TRON_ADDRESS;
 }
 
-/** Same-chain EVM pairs can race Sushi; everything else is Relay-only. */
+/** Same-chain EVM pairs can race Sushi. */
 export function canUseSushi(from: Token, to: Token): boolean {
   if (isTronToken(from) || isTronToken(to)) return false;
   if (from.chainId !== to.chainId) return false;
-  // Sushi swap API covers major EVMs we list (BSC + ETH today).
   return from.chainId === 56 || from.chainId === 1;
+}
+
+/** Cross-chain EVM pairs can race LI.FI (Tron stays Relay-only). */
+export function canUseLifi(from: Token, to: Token): boolean {
+  if (isTronToken(from) || isTronToken(to)) return false;
+  if (from.chainId === to.chainId) return false;
+  const supported = new Set([1, 56]);
+  return supported.has(from.chainId) && supported.has(to.chainId);
+}
+
+function pickBest(a: QuoteResult, b: QuoteResult): QuoteResult {
+  return b.output > a.output ? b : a;
 }
 
 async function quoteRelay(
@@ -77,7 +91,6 @@ async function quoteRelay(
     minOutput,
     inputUsd: inUsd,
     outputUsd: outUsd,
-    // Same-chain has no bridge — don't surface Relay's in−out gap as a "bridge fee".
     bridgeFeeUsd: from.chainId !== to.chainId ? relayFeeUsd(quote) : undefined,
     provider: "relay",
     routeLabel: `${from.symbol} → ${to.symbol} via Relay`,
@@ -106,10 +119,45 @@ async function quoteSushi(
   };
 }
 
+async function quoteLifi(
+  from: Token,
+  to: Token,
+  amountIn: bigint,
+  recipient: string | undefined,
+  slippageBps: number,
+): Promise<QuoteResult | null> {
+  const toAddress =
+    recipient && /^0x[a-fA-F0-9]{40}$/.test(recipient) ? (recipient as Address) : LIFI_QUOTE_USER;
+
+  const q = await getLifiQuote({
+    fromChainId: from.chainId,
+    toChainId: to.chainId,
+    fromToken: from.address,
+    toToken: to.address,
+    amount: amountIn,
+    slippageBps,
+    fromAddress: LIFI_QUOTE_USER,
+    toAddress,
+  });
+  if (!q) return null;
+  return {
+    output: q.amountOut,
+    minOutput: q.amountOutMin > 0n ? q.amountOutMin : applySlippage(q.amountOut, slippageBps),
+    bridgeFeeUsd: q.bridgeFeeUsd,
+    provider: "lifi",
+    routeLabel: `${from.symbol} → ${to.symbol} via LI.FI${q.tool ? ` (${q.tool})` : ""}`,
+  };
+}
+
+function settledValue<T>(r: PromiseSettledResult<T | null>): T | null {
+  if (r.status !== "fulfilled") return null;
+  return r.value;
+}
+
 /**
- * Cross-chain / Tron: Relay only.
- * Same-chain EVM: race Relay vs Sushi and keep the higher expected output.
- * If one side fails, use the other; if both fail, throw.
+ * Same-chain EVM: race Relay vs Sushi.
+ * Cross-chain EVM: race Relay vs LI.FI.
+ * Tron / unsupported: Relay only.
  */
 export async function computeBestQuote(
   from: Token,
@@ -122,32 +170,45 @@ export async function computeBestQuote(
     throw new Error("Unsupported pair.");
   }
 
-  if (!canUseSushi(from, to)) {
-    return quoteRelay(from, to, amountIn, recipient, slippageBps);
+  if (canUseSushi(from, to)) {
+    const [relaySettled, sushiSettled] = await Promise.allSettled([
+      quoteRelay(from, to, amountIn, recipient, slippageBps),
+      quoteSushi(from, to, amountIn, slippageBps),
+    ]);
+    const relay = settledValue(relaySettled);
+    const sushi = settledValue(sushiSettled);
+    if (relay && sushi) return pickBest(relay, sushi);
+    if (relay) return relay;
+    if (sushi) return sushi;
+    const relayErr =
+      relaySettled.status === "rejected"
+        ? relaySettled.reason instanceof Error
+          ? relaySettled.reason.message
+          : String(relaySettled.reason)
+        : "no Relay quote";
+    throw new Error(`No route available (Relay: ${relayErr}; Sushi: no route).`);
   }
 
-  const [relaySettled, sushiSettled] = await Promise.allSettled([
-    quoteRelay(from, to, amountIn, recipient, slippageBps),
-    quoteSushi(from, to, amountIn, slippageBps),
-  ]);
-
-  const relay = relaySettled.status === "fulfilled" ? relaySettled.value : null;
-  const sushi =
-    sushiSettled.status === "fulfilled" && sushiSettled.value != null ? sushiSettled.value : null;
-
-  if (relay && sushi) {
-    return sushi.output > relay.output ? sushi : relay;
+  if (canUseLifi(from, to)) {
+    const [relaySettled, lifiSettled] = await Promise.allSettled([
+      quoteRelay(from, to, amountIn, recipient, slippageBps),
+      quoteLifi(from, to, amountIn, recipient, slippageBps),
+    ]);
+    const relay = settledValue(relaySettled);
+    const lifi = settledValue(lifiSettled);
+    if (relay && lifi) return pickBest(relay, lifi);
+    if (relay) return relay;
+    if (lifi) return lifi;
+    const relayErr =
+      relaySettled.status === "rejected"
+        ? relaySettled.reason instanceof Error
+          ? relaySettled.reason.message
+          : String(relaySettled.reason)
+        : "no Relay quote";
+    throw new Error(`No route available (Relay: ${relayErr}; LI.FI: no route).`);
   }
-  if (relay) return relay;
-  if (sushi) return sushi;
 
-  const relayErr =
-    relaySettled.status === "rejected"
-      ? relaySettled.reason instanceof Error
-        ? relaySettled.reason.message
-        : String(relaySettled.reason)
-      : "no Relay quote";
-  throw new Error(`No route available (Relay: ${relayErr}; Sushi: no route).`);
+  return quoteRelay(from, to, amountIn, recipient, slippageBps);
 }
 
 /** @deprecated Use {@link computeBestQuote}. */
@@ -161,8 +222,8 @@ export async function computeRelayOnlyQuote(
   return computeBestQuote(from, to, amountIn, recipient, slippageBps);
 }
 
-/** Ensure the Sushi router is approved for `amount` of `token` (skip native). */
-export async function ensureSushiAllowance(
+/** Ensure a spender is approved for `amount` of `token` (skip native). */
+export async function ensureErc20Allowance(
   wallet: WalletClient,
   token: Token,
   spender: Address,
@@ -195,3 +256,6 @@ export async function ensureSushiAllowance(
   });
   await waitForTransactionReceipt(wagmiConfig, { hash, chainId });
 }
+
+/** @deprecated Use {@link ensureErc20Allowance}. */
+export const ensureSushiAllowance = ensureErc20Allowance;
