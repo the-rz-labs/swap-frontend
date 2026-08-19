@@ -4,7 +4,7 @@ import { Providers } from "./providers";
 
 export const metadata: Metadata = {
   title: "RzSwap — cross-chain into the RZ ecosystem",
-  description: "Swap any token into RZ ecosystem tokens on BNB Chain. Cross-chain via Relay, final swap via RzSwap.",
+  description: "Swap any token into RZ ecosystem tokens across supported chains. Powered by Relay.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

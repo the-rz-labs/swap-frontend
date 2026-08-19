@@ -16,15 +16,15 @@ export default function Home() {
         <div className="mb-7 text-center">
           <h1 className="text-balance text-3xl font-bold tracking-tight">Swap into the RZ ecosystem</h1>
           <p className="mx-auto mt-2 max-w-sm text-sm text-muted">
-            Bridge from Ethereum and swap into RZ tokens on BNB Chain — one side is always BSC.
+            Swap across Ethereum, Tron, BNB Chain, and other Relay-supported networks into RZ ecosystem
+            tokens.
           </p>
         </div>
 
         <SwapCard />
 
         <p className="mt-6 max-w-md text-center text-xs text-muted">
-          Cross-chain legs are bridged via Relay to USDT on BNB Chain; the final swap runs through the
-          RzSwap contract.
+          Cross-chain swaps are routed and settled through Relay — bridge and token delivery in one flow.
         </p>
       </section>
     </main>
